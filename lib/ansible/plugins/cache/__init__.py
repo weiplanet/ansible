@@ -33,25 +33,8 @@ from ansible.plugins import AnsiblePlugin
 from ansible.plugins.loader import cache_loader
 from ansible.utils.collection_loader import resource_from_fqcr
 from ansible.utils.display import Display
-from ansible.vars.fact_cache import FactCache as RealFactCache
 
 display = Display()
-
-
-class FactCache(RealFactCache):
-    """
-    This is for backwards compatibility.  Will be removed after deprecation.  It was removed as it
-    wasn't actually part of the cache plugin API.  It's actually the code to make use of cache
-    plugins, not the cache plugin itself.  Subclassing it wouldn't yield a usable Cache Plugin and
-    there was no facility to use it as anything else.
-    """
-    def __init__(self, *args, **kwargs):
-        display.deprecated('ansible.plugins.cache.FactCache has been moved to'
-                           ' ansible.vars.fact_cache.FactCache.  If you are looking for the class'
-                           ' to subclass for a cache plugin, you want'
-                           ' ansible.plugins.cache.BaseCacheModule or one of its subclasses.',
-                           version='2.12', collection_name='ansible.builtin')
-        super(FactCache, self).__init__(*args, **kwargs)
 
 
 class BaseCacheModule(AnsiblePlugin):
@@ -319,12 +302,13 @@ class CachePluginAdjudicator(MutableMapping):
 
     def _do_load_key(self, key):
         load = False
-        if key not in self._cache and key not in self._retrieved and self._plugin_name != 'memory':
-            if isinstance(self._plugin, BaseFileCacheModule):
-                load = True
-            elif not isinstance(self._plugin, BaseFileCacheModule) and self._plugin.contains(key):
-                # Database-backed caches don't raise KeyError for expired keys, so only load if the key is valid by checking contains()
-                load = True
+        if all([
+            key not in self._cache,
+            key not in self._retrieved,
+            self._plugin_name != 'memory',
+            self._plugin.contains(key),
+        ]):
+            load = True
         return load
 
     def __getitem__(self, key):
@@ -368,8 +352,7 @@ class CachePluginAdjudicator(MutableMapping):
         self._cache[key] = value
 
     def flush(self):
-        for key in self._cache.keys():
-            self._plugin.delete(key)
+        self._plugin.flush()
         self._cache = {}
 
     def update(self, value):

@@ -29,6 +29,7 @@ from .data import (
 )
 
 try:
+    # noinspection PyTypeChecker
     TIntegrationConfig = t.TypeVar('TIntegrationConfig', bound='IntegrationConfig')
 except AttributeError:
     TIntegrationConfig = None  # pylint: disable=invalid-name
@@ -66,6 +67,9 @@ class EnvironmentConfig(CommonConfig):
         """
         super(EnvironmentConfig, self).__init__(args, command)
 
+        self.pypi_endpoint = args.pypi_endpoint  # type: str
+        self.pypi_proxy = args.pypi_proxy  # type: bool
+
         self.local = args.local is True
         self.venv = args.venv
         self.venv_system_site_packages = args.venv_system_site_packages
@@ -90,13 +94,14 @@ class EnvironmentConfig(CommonConfig):
         self.docker_seccomp = args.docker_seccomp if 'docker_seccomp' in args else None  # type: str
         self.docker_memory = args.docker_memory if 'docker_memory' in args else None
         self.docker_terminate = args.docker_terminate if 'docker_terminate' in args else None  # type: str
+        self.docker_network = args.docker_network if 'docker_network' in args else None  # type: str
 
         if self.docker_seccomp is None:
             self.docker_seccomp = get_docker_completion().get(self.docker_raw, {}).get('seccomp', 'default')
 
         self.remote_stage = args.remote_stage  # type: str
         self.remote_provider = args.remote_provider  # type: str
-        self.remote_aws_region = args.remote_aws_region  # type: str
+        self.remote_endpoint = args.remote_endpoint  # type: t.Optional[str]
         self.remote_terminate = args.remote_terminate  # type: str
 
         if self.remote_provider == 'default':
@@ -120,11 +125,7 @@ class EnvironmentConfig(CommonConfig):
         if self.delegate:
             self.requirements = True
 
-        self.inject_httptester = args.inject_httptester if 'inject_httptester' in args else False  # type: bool
-        self.httptester = docker_qualify_image(args.httptester if 'httptester' in args else '')  # type: str
-
-        if self.get_delegated_completion().get('httptester', 'enabled') == 'disabled':
-            self.httptester = False
+        self.containers = args.containers  # type: t.Optional[t.Dict[str, t.Dict[str, t.Dict[str, t.Any]]]]
 
         if self.get_delegated_completion().get('pip-check', 'enabled') == 'disabled':
             self.pip_check = False
@@ -224,9 +225,6 @@ class ShellConfig(EnvironmentConfig):
         super(ShellConfig, self).__init__(args, 'shell')
 
         self.raw = args.raw  # type: bool
-
-        if self.raw:
-            self.httptester = False
 
 
 class SanityConfig(TestConfig):

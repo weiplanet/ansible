@@ -42,6 +42,12 @@ try:
 except ImportError:
     HAS_UNIQUE = False
 
+try:
+    from jinja2.filters import do_max, do_min
+    HAS_MIN_MAX = True
+except ImportError:
+    HAS_MIN_MAX = False
+
 display = Display()
 
 
@@ -56,11 +62,7 @@ def unique(environment, a, case_sensitive=False, attribute=None):
     error = e = None
     try:
         if HAS_UNIQUE:
-            c = do_unique(environment, a, case_sensitive=case_sensitive, attribute=attribute)
-            if isinstance(a, Hashable):
-                c = set(c)
-            else:
-                c = list(c)
+            c = list(do_unique(environment, a, case_sensitive=case_sensitive, attribute=attribute))
     except TypeError as e:
         error = e
         _do_fail(e)
@@ -76,13 +78,11 @@ def unique(environment, a, case_sensitive=False, attribute=None):
             raise AnsibleFilterError("Ansible's unique filter does not support case_sensitive nor attribute parameters, "
                                      "you need a newer version of Jinja2 that provides their version of the filter.")
 
-        if isinstance(a, Hashable):
-            c = set(a)
-        else:
-            c = []
-            for x in a:
-                if x not in c:
-                    c.append(x)
+        c = []
+        for x in a:
+            if x not in c:
+                c.append(x)
+
     return c
 
 
@@ -123,14 +123,28 @@ def union(environment, a, b):
     return c
 
 
-def min(a):
-    _min = __builtins__.get('min')
-    return _min(a)
+@environmentfilter
+def min(environment, a, **kwargs):
+    if HAS_MIN_MAX:
+        return do_min(environment, a, **kwargs)
+    else:
+        if kwargs:
+            raise AnsibleFilterError("Ansible's min filter does not support any keyword arguments. "
+                                     "You need Jinja2 2.10 or later that provides their version of the filter.")
+        _min = __builtins__.get('min')
+        return _min(a)
 
 
-def max(a):
-    _max = __builtins__.get('max')
-    return _max(a)
+@environmentfilter
+def max(environment, a, **kwargs):
+    if HAS_MIN_MAX:
+        return do_max(environment, a, **kwargs)
+    else:
+        if kwargs:
+            raise AnsibleFilterError("Ansible's max filter does not support any keyword arguments. "
+                                     "You need Jinja2 2.10 or later that provides their version of the filter.")
+        _max = __builtins__.get('max')
+        return _max(a)
 
 
 def logarithm(x, base=math.e):

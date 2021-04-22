@@ -292,7 +292,7 @@ on an interface:
     iface eth0 inet6 static
         address 2001:db8:deaf:be11::ef3/64
 
-If needed, you can extract subnet and prefix information from the 'host/prefix' value::
+If needed, you can extract subnet and prefix information from the 'host/prefix' value:
 
 .. code-block:: jinja
 
@@ -301,7 +301,6 @@ If needed, you can extract subnet and prefix information from the 'host/prefix' 
 
     # {{ host_prefix | ansible.netcommon.ipaddr('host/prefix') | ansible.netcommon.ipaddr('prefix') }}
     [64, 24]
-
 
 Converting subnet masks to CIDR notation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -505,7 +504,7 @@ The ``network_in_network`` filter returns whether an address or a network passed
 
 To check whether multiple addresses belong to a network, use the ``reduce_on_network`` filter::
 
-    # {{ '192.168.0.0/24' | ansible.netcommon.reduce_on_network( ['192.168.0.34', '10.3.0.3', '192.168.2.34'] ) }}
+    # {{ ['192.168.0.34', '10.3.0.3', '192.168.2.34'] | ansible.netcommon.reduce_on_network( '192.168.0.0/24' ) }}
     ['192.168.0.34']
 
 
@@ -716,7 +715,7 @@ Generate an IPv6 address in Stateless Configuration (SLAAC)
 
 the filter ``slaac()`` generates an IPv6 address for a given network and a MAC Address in Stateless Configuration::
 
-    # {{ fdcf:1894:23b5:d38c:0000:0000:0000:0000 | slaac('c2:31:b3:83:bf:2b') }}
+    # {{ 'fdcf:1894:23b5:d38c:0000:0000:0000:0000' | slaac('c2:31:b3:83:bf:2b') }}
     fdcf:1894:23b5:d38c:c031:b3ff:fe83:bf2b
 
 .. seealso::
@@ -737,7 +736,7 @@ the filter ``slaac()`` generates an IPv6 address for a given network and a MAC A
    :ref:`playbooks_reuse_roles`
        Playbook organization by roles
    :ref:`playbooks_best_practices`
-       Best practices in playbooks
+    	 Tips and tricks for playbooks
    `User Mailing List <https://groups.google.com/group/ansible-devel>`_
        Have a question?  Stop by the google group!
    `irc.freenode.net <http://irc.freenode.net>`_

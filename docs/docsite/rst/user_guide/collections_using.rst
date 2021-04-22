@@ -5,11 +5,12 @@
 Using collections
 *****************
 
-Collections are a distribution format for Ansible content that can include playbooks, roles, modules, and plugins.
+Collections are a distribution format for Ansible content that can include playbooks, roles, modules, and plugins. As modules move from the core Ansible repository into collections, the module documentation will move to the :ref:`collections pages <list_of_collections>`.
+
 You can install and use collections through `Ansible Galaxy <https://galaxy.ansible.com>`_.
 
 * For details on how to *develop* collections see :ref:`developing_collections`.
-* For the current development status of Collections and FAQ see `Ansible Collections Community Guide <https://github.com/ansible-collections/general/blob/master/README.rst>`_.
+* For the current development status of Collections and FAQ see `Ansible Collections Community Guide <https://github.com/ansible-collections/overview/blob/main/README.rst>`_.
 
 .. contents::
    :local:
@@ -95,6 +96,30 @@ requirements file in the format documented with :ref:`collection_requirements_fi
 .. code-block:: bash
 
    ansible-galaxy collection download -r requirements.yml
+
+You can also download a source collection directory. The collection is built with the mandatory ``galaxy.yml`` file.
+
+.. code-block:: bash
+
+   ansible-galaxy collection download /path/to/collection
+
+   ansible-galaxy collection download git+file:///path/to/collection/.git
+
+You can download multiple source collections from a single namespace by providing the path to the namespace.
+
+.. code-block:: text
+
+   ns/
+   ├── collection1/
+   │   ├── galaxy.yml
+   │   └── plugins/
+   └── collection2/
+       ├── galaxy.yml
+       └── plugins/
+
+.. code-block:: bash
+
+   ansible-galaxy collection install /path/to/ns
 
 All the collections are downloaded by default to the ``./collections`` folder but you can use ``-p`` or
 ``--download-path`` to specify another path:
@@ -273,7 +298,7 @@ Simplifying module names with the ``collections`` keyword
 The ``collections`` keyword lets you define a list of collections that your role or playbook should search for unqualified module and action names. So you can use the ``collections`` keyword, then simply refer to modules and action plugins by their short-form names throughout that role or playbook.
 
 .. warning::
-   If your playbook uses both the ``collections`` keyword and one or more roles, the roles do not inherit the collections set by the playbook. See below for details.
+   If your playbook uses both the ``collections`` keyword and one or more roles, the roles do not inherit the collections set by the playbook. This is one of the reasons we recommend you always use FQCN. See below for roles details.
 
 Using ``collections`` in roles
 ------------------------------
@@ -307,9 +332,41 @@ In a playbook, you can control the collections Ansible searches for modules and 
              option1: value
 
          - debug:
-             msg: '{{ lookup("my_namespace.my_collection.lookup1", 'param1')| my_namespace.my_collection.filter1 }}'
+             msg: '{{ lookup("my_namespace.my_collection.lookup1", "param1")| my_namespace.my_collection.filter1 }}'
 
-The ``collections`` keyword merely creates an ordered 'search path' for non-namespaced plugin and role references. It does not install content or otherwise change Ansible's behavior around the loading of plugins or roles. Note that an FQCN is still required for non-action or module plugins (e.g., lookups, filters, tests).
+The ``collections`` keyword merely creates an ordered 'search path' for non-namespaced plugin and role references. It does not install content or otherwise change Ansible's behavior around the loading of plugins or roles. Note that an FQCN is still required for non-action or module plugins (for example, lookups, filters, tests).
+
+
+Using a playbook from a collection
+==================================
+
+.. versionadded:: 2.11
+
+You can also distribute playbooks in your collection and invoke them using the same semantics you use for plugins:
+
+.. code-block:: shell
+
+    ansible-playbook my_namespace.my_collection.playbook1 -i ./myinventory
+
+From inside a playbook:
+
+.. code-block:: yaml
+
+    - import_playbook: my_namespace.my_collection.playbookX
+
+
+A few recommendations when creating such playbooks, ``hosts:`` should be generic or at least have a variable input.
+
+.. code-block:: yaml
+
+ - hosts: all  # Use --limit or customized inventory to restrict hosts targeted
+
+ - hosts: localhost  # For things you want to restrict to the controller
+
+ - hosts: '{{target|default("webservers")}}'  # Assumes inventory provides a 'webservers' group, but can also use ``-e 'target=host1,host2'``
+
+
+This will have an implied entry in the ``collections:`` keyword of ``my_namespace.my_collection`` just as with roles.
 
 .. seealso::
 

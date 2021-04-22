@@ -15,6 +15,7 @@ from jinja2.exceptions import UndefinedError
 
 from ansible import constants as C
 from ansible import context
+from ansible.errors import AnsibleError
 from ansible.module_utils.six import iteritems, string_types, with_metaclass
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.errors import AnsibleParserError, AnsibleUndefinedVariable, AnsibleAssertionError
@@ -179,6 +180,10 @@ class FieldAttributeBase(with_metaclass(BaseMeta, object)):
         # and init vars, avoid using defaults in field declaration as it lives across plays
         self.vars = dict()
 
+    @property
+    def finalized(self):
+        return self._finalized
+
     def dump_me(self, depth=0):
         ''' this is never called from production code, it is here to be used when debugging as a 'complex print' '''
         if depth == 0:
@@ -315,7 +320,10 @@ class FieldAttributeBase(with_metaclass(BaseMeta, object)):
         Create a copy of this object and return it.
         '''
 
-        new_me = self.__class__()
+        try:
+            new_me = self.__class__()
+        except RuntimeError as e:
+            raise AnsibleError("Exceeded maximum object depth. This may have been caused by excessive role recursion", orig_exc=e)
 
         for name in self._valid_attrs.keys():
             if name in self._alias_attrs:
@@ -544,6 +552,13 @@ class FieldAttributeBase(with_metaclass(BaseMeta, object)):
                     setattr(self, attr, obj)
                 else:
                     setattr(self, attr, value)
+
+        # from_attrs is only used to create a finalized task
+        # from attrs from the Worker/TaskExecutor
+        # Those attrs are finalized and squashed in the TE
+        # and controller side use needs to reflect that
+        self._finalized = True
+        self._squashed = True
 
     def serialize(self):
         '''

@@ -11,6 +11,10 @@ from .constants import (
     SOFT_RLIMIT_NOFILE,
 )
 
+from .io import (
+    write_text_file,
+)
+
 from .util import (
     common_environment,
     display,
@@ -20,12 +24,14 @@ from .util import (
     ANSIBLE_TEST_DATA_ROOT,
     ANSIBLE_BIN_PATH,
     ANSIBLE_SOURCE_ROOT,
+    get_ansible_version,
 )
 
 from .util_common import (
     create_temp_dir,
     run_command,
     ResultType,
+    intercept_command,
 )
 
 from .config import (
@@ -74,7 +80,8 @@ def ansible_environment(args, color=True, ansible_config=None):
         ANSIBLE_CONFIG=ansible_config,
         ANSIBLE_LIBRARY='/dev/null',
         ANSIBLE_DEVEL_WARNING='false',  # Don't show warnings that CI is running devel
-        PYTHONPATH=get_ansible_python_path(),
+        ANSIBLE_CONTROLLER_PYTHON_WARNING='false',  # Don't show warnings in CI for old controller Python
+        PYTHONPATH=get_ansible_python_path(args),
         PAGER='/bin/cat',
         PATH=path,
         # give TQM worker processes time to report code coverage results
@@ -170,26 +177,57 @@ def configure_plugin_paths(args):  # type: (CommonConfig) -> t.Dict[str, str]
     return env
 
 
-def get_ansible_python_path():  # type: () -> str
+def get_ansible_python_path(args):  # type: (CommonConfig) -> str
     """
     Return a directory usable for PYTHONPATH, containing only the ansible package.
     If a temporary directory is required, it will be cached for the lifetime of the process and cleaned up at exit.
     """
-    if ANSIBLE_SOURCE_ROOT:
-        # when running from source there is no need for a temporary directory to isolate the ansible package
-        return os.path.dirname(ANSIBLE_LIB_ROOT)
-
     try:
         return get_ansible_python_path.python_path
     except AttributeError:
         pass
 
-    python_path = create_temp_dir(prefix='ansible-test-')
+    if ANSIBLE_SOURCE_ROOT:
+        # when running from source there is no need for a temporary directory to isolate the ansible package
+        python_path = os.path.dirname(ANSIBLE_LIB_ROOT)
+    else:
+        # when not running from source the installed directory is unsafe to add to PYTHONPATH
+        # doing so would expose many unwanted packages on sys.path
+        # instead a temporary directory is created which contains only ansible using a symlink
+        python_path = create_temp_dir(prefix='ansible-test-')
+
+        os.symlink(ANSIBLE_LIB_ROOT, os.path.join(python_path, 'ansible'))
+
+    if not args.explain:
+        generate_egg_info(python_path)
+
     get_ansible_python_path.python_path = python_path
 
-    os.symlink(ANSIBLE_LIB_ROOT, os.path.join(python_path, 'ansible'))
-
     return python_path
+
+
+def generate_egg_info(path):  # type: (str) -> None
+    """Generate an egg-info in the specified base directory."""
+    # minimal PKG-INFO stub following the format defined in PEP 241
+    # required for older setuptools versions to avoid a traceback when importing pkg_resources from packages like cryptography
+    # newer setuptools versions are happy with an empty directory
+    # including a stub here means we don't need to locate the existing file or have setup.py generate it when running from source
+    pkg_info = '''
+Metadata-Version: 1.0
+Name: ansible
+Version: %s
+Platform: UNKNOWN
+Summary: Radically simple IT automation
+Author-email: info@ansible.com
+License: GPLv3+
+''' % get_ansible_version()
+
+    pkg_info_path = os.path.join(path, 'ansible_core.egg-info', 'PKG-INFO')
+
+    if os.path.exists(pkg_info_path):
+        return
+
+    write_text_file(pkg_info_path, pkg_info.lstrip(), create_directories=True)
 
 
 def check_pyyaml(args, version, required=True, quiet=False):
@@ -258,3 +296,15 @@ def get_collection_detail(args, python):  # type: (EnvironmentConfig, str) -> Co
     detail.version = str(version) if version is not None else None
 
     return detail
+
+
+def run_playbook(args, inventory_path, playbook, run_playbook_vars):  # type: (CommonConfig, str, str, t.Dict[str, t.Any]) -> None
+    """Run the specified playbook using the given inventory file and playbook variables."""
+    playbook_path = os.path.join(ANSIBLE_TEST_DATA_ROOT, 'playbooks', playbook)
+    command = ['ansible-playbook', '-i', inventory_path, playbook_path, '-e', json.dumps(run_playbook_vars)]
+
+    if args.verbosity:
+        command.append('-%s' % ('v' * args.verbosity))
+
+    env = ansible_environment(args)
+    intercept_command(args, command, '', env, disable_coverage=True)

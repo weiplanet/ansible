@@ -6,18 +6,18 @@
     - name: "read properties value"
       set_fact:
         test1:            "{{lookup('ini', 'value1            type=properties  file=lookup.properties')}}"
-        test2:            "{{lookup('ini', 'value2            type=properties  file=lookup.properties')}}"
-        test_dot:         "{{lookup('ini', 'value.dot         type=properties  file=lookup.properties')}}"
+        test2:            "{{lookup('ini', 'value2', type='properties',  file='lookup.properties')}}"
+        test_dot:         "{{lookup('ini', 'value.dot', type='properties',  file='lookup.properties')}}"
         field_with_space: "{{lookup('ini', 'field.with.space  type=properties  file=lookup.properties')}}"
     - assert:
         that: "{{item}} is defined"
       with_items: [ 'test1', 'test2', 'test_dot', 'field_with_space' ]
     - name: "read ini value"
       set_fact:
-        value1_global:    "{{lookup('ini', 'value1            section=global   file=lookup.ini')}}"
-        value2_global:    "{{lookup('ini', 'value2            section=global   file=lookup.ini')}}"
-        value1_section1:  "{{lookup('ini', 'value1            section=section1 file=lookup.ini')}}"
-        field_with_unicode: "{{lookup('ini', 'unicode         section=global   file=lookup.ini')}}"
+        value1_global:    "{{lookup('ini', 'value1', section='global', file='lookup.ini')}}"
+        value2_global:    "{{lookup('ini', 'value2', section='global', file='lookup.ini')}}"
+        value1_section1:  "{{lookup('ini', 'value1', section='section1', file='lookup.ini')}}"
+        field_with_unicode: "{{lookup('ini', 'unicode', section='global', file='lookup.ini')}}"
     - debug: var={{item}}
       with_items: [ 'value1_global', 'value2_global', 'value1_section1', 'field_with_unicode' ]
     - assert:
@@ -69,3 +69,17 @@
         that:
           - '_.results.0.item == "section1/value1"'
           - '_.results.1.item == "section1/value2"'
+
+
+    - name: capture bad behaviour
+      block:
+        - name: mix options type and push key out of order
+          debug: msg="{{ lookup('ini', 'file=lookup.ini', 'value1', section='value_section') }}"
+          register: bad_mojo
+          ignore_errors: true
+
+        - name: verify
+          assert:
+            that:
+            - bad_mojo is failed
+            - '"No key to lookup was provided as first term with in string inline option" in bad_mojo.msg'

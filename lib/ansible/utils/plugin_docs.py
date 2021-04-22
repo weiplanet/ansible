@@ -6,19 +6,20 @@ __metaclass__ = type
 
 from ansible import constants as C
 from ansible.release import __version__ as ansible_version
-from ansible.errors import AnsibleError, AnsibleAssertionError
+from ansible.errors import AnsibleError
 from ansible.module_utils.six import string_types
 from ansible.module_utils._text import to_native
 from ansible.module_utils.common._collections_compat import MutableMapping, MutableSet, MutableSequence
 from ansible.parsing.plugin_docs import read_docstring
 from ansible.parsing.yaml.loader import AnsibleLoader
 from ansible.utils.display import Display
+from ansible.utils.vars import combine_vars
 
 display = Display()
 
 
 # modules that are ok that they do not have documentation strings
-BLACKLIST = {
+REJECTLIST = {
     'MODULE': frozenset(('async_wrapper',)),
     'CACHE': frozenset(('base',)),
 }
@@ -42,14 +43,15 @@ def merge_fragment(target, source):
 
 def _process_versions_and_dates(fragment, is_module, return_docs, callback):
     def process_deprecation(deprecation, top_level=False):
+        collection_name = 'removed_from_collection' if top_level else 'collection_name'
         if not isinstance(deprecation, MutableMapping):
             return
         if (is_module or top_level) and 'removed_in' in deprecation:  # used in module deprecations
-            callback(deprecation, 'removed_in', 'removed_from_collection')
+            callback(deprecation, 'removed_in', collection_name)
         if 'removed_at_date' in deprecation:
-            callback(deprecation, 'removed_at_date', 'removed_from_collection')
+            callback(deprecation, 'removed_at_date', collection_name)
         if not (is_module or top_level) and 'version' in deprecation:  # used in plugin option deprecations
-            callback(deprecation, 'version', 'removed_from_collection')
+            callback(deprecation, 'version', collection_name)
 
     def process_option_specifiers(specifiers):
         for specifier in specifiers:
@@ -73,6 +75,8 @@ def _process_versions_and_dates(fragment, is_module, return_docs, callback):
                     process_option_specifiers(option['ini'])
                 if isinstance(option.get('vars'), list):
                     process_option_specifiers(option['vars'])
+                if isinstance(option.get('deprecated'), MutableMapping):
+                    process_deprecation(option['deprecated'])
             if isinstance(option.get('suboptions'), MutableMapping):
                 process_options(option['suboptions'])
 
@@ -176,17 +180,19 @@ def add_fragments(doc, filename, fragment_loader, is_module=False):
                     doc['seealso'] = []
                 doc['seealso'].extend(seealso)
 
-        if 'options' not in fragment:
-            raise Exception("missing options in fragment (%s), possibly misformatted?: %s" % (fragment_name, filename))
+        if 'options' not in fragment and 'attributes' not in fragment:
+            raise Exception("missing options or attributes in fragment (%s), possibly misformatted?: %s" % (fragment_name, filename))
 
         # ensure options themselves are directly merged
-        if 'options' in doc:
-            try:
-                merge_fragment(doc['options'], fragment.pop('options'))
-            except Exception as e:
-                raise AnsibleError("%s options (%s) of unknown type: %s" % (to_native(e), fragment_name, filename))
-        else:
-            doc['options'] = fragment.pop('options')
+        for doc_key in ['options', 'attributes']:
+            if doc_key in fragment:
+                if doc_key in doc:
+                    try:
+                        merge_fragment(doc[doc_key], fragment.pop(doc_key))
+                    except Exception as e:
+                        raise AnsibleError("%s %s (%s) of unknown type: %s" % (to_native(e), doc_key, fragment_name, filename))
+                else:
+                    doc[doc_key] = fragment.pop(doc_key)
 
         # merge rest of the sections
         try:

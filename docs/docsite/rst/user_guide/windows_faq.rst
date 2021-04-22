@@ -70,6 +70,21 @@ installed version and then clone the git repo.
     # To enable Ansible on login, run the following
     echo ". ~/ansible/hacking/env-setup -q' >> ~/.bashrc
 
+If you encounter timeout errors when running Ansible on the WSL, this may be due to an issue
+with ``sleep`` not returning correctly. The following workaround may resolve the issue:
+
+.. code-block:: shell
+
+    mv /usr/bin/sleep /usr/bin/sleep.orig
+    ln -s /bin/true /usr/bin/sleep
+
+Another option is to use WSL 2 if running Windows 10 later than build 2004.
+
+.. code-block:: shell
+
+    wsl --set-default-version 2
+
+
 Can I use SSH keys to authenticate to Windows hosts?
 ````````````````````````````````````````````````````
 You cannot use SSH keys with the WinRM or PSRP connection plugins.
@@ -229,7 +244,7 @@ host.
    :ref:`about_playbooks`
        An introduction to playbooks
    :ref:`playbooks_best_practices`
-       Best practices advice
+       Tips and tricks for playbooks
    `User Mailing List <https://groups.google.com/group/ansible-project>`_
        Have a question?  Stop by the google group!
    `irc.freenode.net <http://irc.freenode.net>`_

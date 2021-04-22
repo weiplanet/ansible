@@ -2,6 +2,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import atexit
 import json
 import os
 import datetime
@@ -9,7 +10,6 @@ import re
 import time
 import textwrap
 import functools
-import hashlib
 import difflib
 import filecmp
 import random
@@ -30,6 +30,7 @@ from .core_ci import (
 from .manage_ci import (
     ManageWindowsCI,
     ManageNetworkCI,
+    get_network_settings,
 )
 
 from .cloud import (
@@ -43,7 +44,6 @@ from .cloud import (
 from .io import (
     make_dirs,
     open_text_file,
-    read_binary_file,
     read_text_file,
     write_text_file,
 )
@@ -56,23 +56,21 @@ from .util import (
     remove_tree,
     find_executable,
     raw_command,
-    get_available_port,
     generate_pip_command,
     find_python,
     cmd_quote,
-    ANSIBLE_LIB_ROOT,
     ANSIBLE_TEST_DATA_ROOT,
     ANSIBLE_TEST_CONFIG_ROOT,
-    get_ansible_version,
     tempdir,
     open_zipfile,
     SUPPORTED_PYTHON_VERSIONS,
     str_to_version,
+    version_to_str,
+    get_hash,
 )
 
 from .util_common import (
     get_docker_completion,
-    get_network_settings,
     get_remote_completion,
     get_python_path,
     intercept_command,
@@ -81,20 +79,24 @@ from .util_common import (
     write_json_test_results,
     ResultType,
     handle_layout_messages,
+    CommonConfig,
 )
 
 from .docker_util import (
     docker_pull,
     docker_run,
-    docker_available,
-    docker_rm,
-    get_docker_container_id,
-    get_docker_container_ip,
+    docker_inspect,
+)
+
+from .containers import (
+    SshConnectionDetail,
+    create_container_hooks,
 )
 
 from .ansible_util import (
     ansible_environment,
     check_pyyaml,
+    run_playbook,
 )
 
 from .target import (
@@ -123,6 +125,8 @@ from .config import (
     ShellConfig,
     WindowsIntegrationConfig,
     TIntegrationConfig,
+    UnitsConfig,
+    SanityConfig,
 )
 
 from .metadata import (
@@ -142,10 +146,8 @@ from .data import (
     data_context,
 )
 
-HTTPTESTER_HOSTS = (
-    'ansible.http.tests',
-    'sni1.ansible.http.tests',
-    'fail.ansible.http.tests',
+from .http import (
+    urlparse,
 )
 
 
@@ -182,6 +184,42 @@ def create_shell_command(command):
     return cmd
 
 
+def get_openssl_version(args, python, python_version):  # type: (EnvironmentConfig, str, str) -> t.Optional[t.Tuple[int, ...]]
+    """Return the openssl version."""
+    if not python_version.startswith('2.'):
+        # OpenSSL version checking only works on Python 3.x.
+        # This should be the most accurate, since it is the Python we will be using.
+        version = json.loads(run_command(args, [python, os.path.join(ANSIBLE_TEST_DATA_ROOT, 'sslcheck.py')], capture=True, always=True)[0])['version']
+
+        if version:
+            display.info('Detected OpenSSL version %s under Python %s.' % (version_to_str(version), python_version), verbosity=1)
+
+            return tuple(version)
+
+    # Fall back to detecting the OpenSSL version from the CLI.
+    # This should provide an adequate solution on Python 2.x.
+    openssl_path = find_executable('openssl', required=False)
+
+    if openssl_path:
+        try:
+            result = raw_command([openssl_path, 'version'], capture=True)[0]
+        except SubprocessError:
+            result = ''
+
+        match = re.search(r'^OpenSSL (?P<version>[0-9]+\.[0-9]+\.[0-9]+)', result)
+
+        if match:
+            version = str_to_version(match.group('version'))
+
+            display.info('Detected OpenSSL version %s using the openssl CLI.' % version_to_str(version), verbosity=1)
+
+            return version
+
+    display.info('Unable to detect OpenSSL version.', verbosity=1)
+
+    return None
+
+
 def get_setuptools_version(args, python):  # type: (EnvironmentConfig, str) -> t.Tuple[int]
     """Return the setuptools version for the given python."""
     try:
@@ -193,21 +231,48 @@ def get_setuptools_version(args, python):  # type: (EnvironmentConfig, str) -> t
         raise
 
 
-def get_cryptography_requirement(args, python_version):  # type: (EnvironmentConfig, str) -> str
+def install_cryptography(args, python, python_version, pip):  # type: (EnvironmentConfig, str, str, t.List[str]) -> None
+    """
+    Install cryptography for the specified environment.
+    """
+    # make sure ansible-test's basic requirements are met before continuing
+    # this is primarily to ensure that pip is new enough to facilitate further requirements installation
+    install_ansible_test_requirements(args, pip)
+
+    # make sure setuptools is available before trying to install cryptography
+    # the installed version of setuptools affects the version of cryptography to install
+    run_command(args, generate_pip_install(pip, '', packages=['setuptools']))
+
+    # install the latest cryptography version that the current requirements can support
+    # use a custom constraints file to avoid the normal constraints file overriding the chosen version of cryptography
+    # if not installed here later install commands may try to install an unsupported version due to the presence of older setuptools
+    # this is done instead of upgrading setuptools to allow tests to function with older distribution provided versions of setuptools
+    run_command(args, generate_pip_install(pip, '',
+                                           packages=[get_cryptography_requirement(args, python, python_version)],
+                                           constraints=os.path.join(ANSIBLE_TEST_DATA_ROOT, 'cryptography-constraints.txt')))
+
+
+def get_cryptography_requirement(args, python, python_version):  # type: (EnvironmentConfig, str, str) -> str
     """
     Return the correct cryptography requirement for the given python version.
-    The version of cryptograpy installed depends on the python version and setuptools version.
+    The version of cryptography installed depends on the python version, setuptools version and openssl version.
     """
-    python = find_python(python_version)
     setuptools_version = get_setuptools_version(args, python)
+    openssl_version = get_openssl_version(args, python, python_version)
 
     if setuptools_version >= (18, 5):
         if python_version == '2.6':
             # cryptography 2.2+ requires python 2.7+
             # see https://github.com/pyca/cryptography/blob/master/CHANGELOG.rst#22---2018-03-19
             cryptography = 'cryptography < 2.2'
+        elif openssl_version and openssl_version < (1, 1, 0):
+            # cryptography 3.2 requires openssl 1.1.x or later
+            # see https://cryptography.io/en/latest/changelog.html#v3-2
+            cryptography = 'cryptography < 3.2'
         else:
-            cryptography = 'cryptography'
+            # cryptography 3.4+ fails to install on many systems
+            # this is a temporary work-around until a more permanent solution is available
+            cryptography = 'cryptography < 3.4'
     else:
         # cryptography 2.1+ requires setuptools 18.5+
         # see https://github.com/pyca/cryptography/blob/62287ae18383447585606b9d0765c0f1b8a9777c/setup.py#L26
@@ -231,8 +296,6 @@ def install_command_requirements(args, python_version=None, context=None, enable
         if args.raw:
             return
 
-    generate_egg_info(args)
-
     if not args.requirements:
         return
 
@@ -250,7 +313,8 @@ def install_command_requirements(args, python_version=None, context=None, enable
     if not python_version:
         python_version = args.python_version
 
-    pip = generate_pip_command(find_python(python_version))
+    python = find_python(python_version)
+    pip = generate_pip_command(python)
 
     # skip packages which have aleady been installed for python_version
 
@@ -268,19 +332,7 @@ def install_command_requirements(args, python_version=None, context=None, enable
     installed_packages.update(packages)
 
     if args.command != 'sanity':
-        install_ansible_test_requirements(args, pip)
-
-        # make sure setuptools is available before trying to install cryptography
-        # the installed version of setuptools affects the version of cryptography to install
-        run_command(args, generate_pip_install(pip, '', packages=['setuptools']))
-
-        # install the latest cryptography version that the current requirements can support
-        # use a custom constraints file to avoid the normal constraints file overriding the chosen version of cryptography
-        # if not installed here later install commands may try to install an unsupported version due to the presence of older setuptools
-        # this is done instead of upgrading setuptools to allow tests to function with older distribution provided versions of setuptools
-        run_command(args, generate_pip_install(pip, '',
-                                               packages=[get_cryptography_requirement(args, python_version)],
-                                               constraints=os.path.join(ANSIBLE_TEST_DATA_ROOT, 'cryptography-constraints.txt')))
+        install_cryptography(args, python, python_version, pip)
 
     commands = [generate_pip_install(pip, args.command, packages=packages, context=context)]
 
@@ -378,46 +430,6 @@ def pip_list(args, pip):
     return stdout
 
 
-def generate_egg_info(args):
-    """
-    :type args: EnvironmentConfig
-    """
-    if args.explain:
-        return
-
-    ansible_version = get_ansible_version()
-
-    # inclusion of the version number in the path is optional
-    # see: https://setuptools.readthedocs.io/en/latest/formats.html#filename-embedded-metadata
-    egg_info_path = ANSIBLE_LIB_ROOT + '_base-%s.egg-info' % ansible_version
-
-    if os.path.exists(egg_info_path):
-        return
-
-    egg_info_path = ANSIBLE_LIB_ROOT + '_base.egg-info'
-
-    if os.path.exists(egg_info_path):
-        return
-
-    # minimal PKG-INFO stub following the format defined in PEP 241
-    # required for older setuptools versions to avoid a traceback when importing pkg_resources from packages like cryptography
-    # newer setuptools versions are happy with an empty directory
-    # including a stub here means we don't need to locate the existing file or have setup.py generate it when running from source
-    pkg_info = '''
-Metadata-Version: 1.0
-Name: ansible
-Version: %s
-Platform: UNKNOWN
-Summary: Radically simple IT automation
-Author-email: info@ansible.com
-License: GPLv3+
-''' % get_ansible_version()
-
-    pkg_info_path = os.path.join(egg_info_path, 'PKG-INFO')
-
-    write_text_file(pkg_info_path, pkg_info.lstrip(), create_directories=True)
-
-
 def generate_pip_install(pip, command, packages=None, constraints=None, use_constraints=True, context=None):
     """
     :type pip: list[str]
@@ -430,6 +442,7 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
     """
     constraints = constraints or os.path.join(ANSIBLE_TEST_DATA_ROOT, 'requirements', 'constraints.txt')
     requirements = os.path.join(ANSIBLE_TEST_DATA_ROOT, 'requirements', '%s.txt' % ('%s.%s' % (command, context) if context else command))
+    content_constraints = None
 
     options = []
 
@@ -448,6 +461,8 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         if os.path.exists(requirements) and os.path.getsize(requirements):
             options += ['-r', requirements]
 
+        content_constraints = os.path.join(data_context().content.unit_path, 'constraints.txt')
+
     if command in ('integration', 'windows-integration', 'network-integration'):
         requirements = os.path.join(data_context().content.integration_path, 'requirements.txt')
 
@@ -459,6 +474,11 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         if os.path.exists(requirements) and os.path.getsize(requirements):
             options += ['-r', requirements]
 
+        content_constraints = os.path.join(data_context().content.integration_path, 'constraints.txt')
+
+    if command.startswith('integration.cloud.'):
+        content_constraints = os.path.join(data_context().content.integration_path, 'constraints.txt')
+
     if packages:
         options += packages
 
@@ -466,6 +486,10 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         return None
 
     if use_constraints:
+        if content_constraints and os.path.exists(content_constraints) and os.path.getsize(content_constraints):
+            # listing content constraints first gives them priority over constraints provided by ansible-test
+            options.extend(['-c', content_constraints])
+
         options.extend(['-c', constraints])
 
     return pip + ['install', '--disable-pip-version-check'] + options
@@ -479,9 +503,6 @@ def command_shell(args):
         raise Delegate()
 
     install_command_requirements(args)
-
-    if args.inject_httptester:
-        inject_httptester(args)
 
     cmd = create_shell_command(['bash', '-i'])
     run_command(args, cmd)
@@ -498,7 +519,12 @@ def command_posix_integration(args):
 
     all_targets = tuple(walk_posix_integration_targets(include_hidden=True))
     internal_targets = command_integration_filter(args, all_targets)
-    command_integration_filtered(args, internal_targets, all_targets, inventory_path)
+
+    managed_connections = None  # type: t.Optional[t.List[SshConnectionDetail]]
+
+    pre_target, post_target = create_container_hooks(args, managed_connections)
+
+    command_integration_filtered(args, internal_targets, all_targets, inventory_path, pre_target=pre_target, post_target=post_target)
 
 
 def command_network_integration(args):
@@ -557,7 +583,7 @@ def command_network_integration(args):
             time.sleep(1)
 
         remotes = [instance.wait_for_result() for instance in instances]
-        inventory = network_inventory(remotes)
+        inventory = network_inventory(args, remotes)
 
         display.info('>>> Inventory: %s\n%s' % (inventory_path, inventory.strip()), verbosity=3)
 
@@ -635,14 +661,15 @@ def network_run(args, platform, version, config):
     core_ci.load(config)
     core_ci.wait()
 
-    manage = ManageNetworkCI(core_ci)
+    manage = ManageNetworkCI(args, core_ci)
     manage.wait()
 
     return core_ci
 
 
-def network_inventory(remotes):
+def network_inventory(args, remotes):
     """
+    :type args: NetworkIntegrationConfig
     :type remotes: list[AnsibleCoreCI]
     :rtype: str
     """
@@ -656,7 +683,7 @@ def network_inventory(remotes):
             ansible_ssh_private_key_file=os.path.abspath(remote.ssh_key.key),
         )
 
-        settings = get_network_settings(remote.args, remote.platform, remote.version)
+        settings = get_network_settings(args, remote.platform, remote.version)
 
         options.update(settings.inventory_vars)
 
@@ -714,9 +741,7 @@ def command_windows_integration(args):
     all_targets = tuple(walk_windows_integration_targets(include_hidden=True))
     internal_targets = command_integration_filter(args, all_targets, init_callback=windows_init)
     instances = []  # type: t.List[WrappedThread]
-    pre_target = None
-    post_target = None
-    httptester_id = None
+    managed_connections = []  # type: t.List[SshConnectionDetail]
 
     if args.windows:
         get_python_path(args, args.python_executable)  # initialize before starting threads
@@ -742,72 +767,41 @@ def command_windows_integration(args):
         if not args.explain:
             write_text_file(inventory_path, inventory)
 
-        use_httptester = args.httptester and any('needs/httptester/' in target.aliases for target in internal_targets)
-        # if running under Docker delegation, the httptester may have already been started
-        docker_httptester = bool(os.environ.get("HTTPTESTER", False))
+        for core_ci in remotes:
+            ssh_con = core_ci.connection
+            ssh = SshConnectionDetail(core_ci.name, ssh_con.hostname, 22, ssh_con.username, core_ci.ssh_key.key, shell_type='powershell')
+            managed_connections.append(ssh)
+    elif args.explain:
+        identity_file = SshKey(args).key
 
-        if use_httptester and not docker_available() and not docker_httptester:
-            display.warning('Assuming --disable-httptester since `docker` is not available.')
-        elif use_httptester:
-            if docker_httptester:
-                # we are running in a Docker container that is linked to the httptester container, we just need to
-                # forward these requests to the linked hostname
-                first_host = HTTPTESTER_HOSTS[0]
-                ssh_options = ["-R", "8080:%s:80" % first_host, "-R", "8443:%s:443" % first_host]
-            else:
-                # we are running directly and need to start the httptester container ourselves and forward the port
-                # from there manually set so HTTPTESTER env var is set during the run
-                args.inject_httptester = True
-                httptester_id, ssh_options = start_httptester(args)
+        # mock connection details to prevent tracebacks in explain mode
+        managed_connections = [SshConnectionDetail(
+            name='windows',
+            host='windows',
+            port=22,
+            user='administrator',
+            identity_file=identity_file,
+            shell_type='powershell',
+        )]
+    else:
+        inventory = parse_inventory(args, inventory_path)
+        hosts = get_hosts(inventory, 'windows')
+        identity_file = SshKey(args).key
 
-            # to get this SSH command to run in the background we need to set to run in background (-f) and disable
-            # the pty allocation (-T)
-            ssh_options.insert(0, "-fT")
+        managed_connections = [SshConnectionDetail(
+            name=name,
+            host=config['ansible_host'],
+            port=22,
+            user=config['ansible_user'],
+            identity_file=identity_file,
+            shell_type='powershell',
+        ) for name, config in hosts.items()]
 
-            # create a script that will continue to run in the background until the script is deleted, this will
-            # cleanup and close the connection
-            def forward_ssh_ports(target):
-                """
-                :type target: IntegrationTarget
-                """
-                if 'needs/httptester/' not in target.aliases:
-                    return
+        if managed_connections:
+            display.info('Generated SSH connection details from inventory:\n%s' % (
+                '\n'.join('%s %s@%s:%d' % (ssh.name, ssh.user, ssh.host, ssh.port) for ssh in managed_connections)), verbosity=1)
 
-                for remote in [r for r in remotes if r.version != '2008']:
-                    manage = ManageWindowsCI(remote)
-                    manage.upload(os.path.join(ANSIBLE_TEST_DATA_ROOT, 'setup', 'windows-httptester.ps1'), watcher_path)
-
-                    # We cannot pass an array of string with -File so we just use a delimiter for multiple values
-                    script = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\%s -Hosts \"%s\"" \
-                             % (watcher_path, "|".join(HTTPTESTER_HOSTS))
-                    if args.verbosity > 3:
-                        script += " -Verbose"
-                    manage.ssh(script, options=ssh_options, force_pty=False)
-
-            def cleanup_ssh_ports(target):
-                """
-                :type target: IntegrationTarget
-                """
-                if 'needs/httptester/' not in target.aliases:
-                    return
-
-                for remote in [r for r in remotes if r.version != '2008']:
-                    # delete the tmp file that keeps the http-tester alive
-                    manage = ManageWindowsCI(remote)
-                    manage.ssh("cmd.exe /c \"del %s /F /Q\"" % watcher_path, force_pty=False)
-
-            watcher_path = "ansible-test-http-watcher-%s.ps1" % time.time()
-            pre_target = forward_ssh_ports
-            post_target = cleanup_ssh_ports
-
-    def run_playbook(playbook, run_playbook_vars):  # type: (str, t.Dict[str, t.Any]) -> None
-        playbook_path = os.path.join(ANSIBLE_TEST_DATA_ROOT, 'playbooks', playbook)
-        command = ['ansible-playbook', '-i', inventory_path, playbook_path, '-e', json.dumps(run_playbook_vars)]
-        if args.verbosity:
-            command.append('-%s' % ('v' * args.verbosity))
-
-        env = ansible_environment(args)
-        intercept_command(args, command, '', env, disable_coverage=True)
+    pre_target, post_target = create_container_hooks(args, managed_connections)
 
     remote_temp_path = None
 
@@ -815,7 +809,7 @@ def command_windows_integration(args):
         # Create the remote directory that is writable by everyone. Use Ansible to talk to the remote host.
         remote_temp_path = 'C:\\ansible_test_coverage_%s' % time.time()
         playbook_vars = {'remote_temp_path': remote_temp_path}
-        run_playbook('windows_coverage_setup.yml', playbook_vars)
+        run_playbook(args, inventory_path, 'windows_coverage_setup.yml', playbook_vars)
 
     success = False
 
@@ -824,14 +818,11 @@ def command_windows_integration(args):
                                      post_target=post_target, remote_temp_path=remote_temp_path)
         success = True
     finally:
-        if httptester_id:
-            docker_rm(args, httptester_id)
-
         if remote_temp_path:
             # Zip up the coverage files that were generated and fetch it back to localhost.
             with tempdir() as local_temp_path:
                 playbook_vars = {'remote_temp_path': remote_temp_path, 'local_temp_path': local_temp_path}
-                run_playbook('windows_coverage_teardown.yml', playbook_vars)
+                run_playbook(args, inventory_path, 'windows_coverage_teardown.yml', playbook_vars)
 
                 for filename in os.listdir(local_temp_path):
                     with open_zipfile(os.path.join(local_temp_path, filename)) as coverage_zip:
@@ -848,6 +839,9 @@ def windows_init(args, internal_targets):  # pylint: disable=locally-disabled, u
     :type args: WindowsIntegrationConfig
     :type internal_targets: tuple[IntegrationTarget]
     """
+    # generate an ssh key (if needed) up front once, instead of for each instance
+    SshKey(args)
+
     if not args.windows:
         return
 
@@ -916,14 +910,7 @@ def windows_inventory(remotes):
         if remote.ssh_key:
             options["ansible_ssh_private_key_file"] = os.path.abspath(remote.ssh_key.key)
 
-        if remote.name == 'windows-2008':
-            options.update(
-                # force 2008 to use PSRP for the connection plugin
-                ansible_connection='psrp',
-                ansible_psrp_auth='basic',
-                ansible_psrp_cert_validation='ignore',
-            )
-        elif remote.name == 'windows-2016':
+        if remote.name == 'windows-2016':
             options.update(
                 # force 2016 to use NTLM + HTTP message encryption
                 ansible_connection='winrm',
@@ -1014,24 +1001,23 @@ def command_integration_filter(args,  # type: TIntegrationConfig
         data_context().register_payload_callback(integration_config_callback)
 
     if args.delegate:
-        raise Delegate(require=require, exclude=exclude, integration_targets=internal_targets)
+        raise Delegate(require=require, exclude=exclude)
 
     install_command_requirements(args)
 
     return internal_targets
 
 
-def command_integration_filtered(args, targets, all_targets, inventory_path, pre_target=None, post_target=None,
-                                 remote_temp_path=None):
-    """
-    :type args: IntegrationConfig
-    :type targets: tuple[IntegrationTarget]
-    :type all_targets: tuple[IntegrationTarget]
-    :type inventory_path: str
-    :type pre_target: (IntegrationTarget) -> None | None
-    :type post_target: (IntegrationTarget) -> None | None
-    :type remote_temp_path: str | None
-    """
+def command_integration_filtered(
+        args,  # type: IntegrationConfig
+        targets,  # type: t.Tuple[IntegrationTarget]
+        all_targets,  # type: t.Tuple[IntegrationTarget]
+        inventory_path,  # type: str
+        pre_target=None,  # type: t.Optional[t.Callable[IntegrationTarget]]
+        post_target=None,  # type: t.Optional[t.Callable[IntegrationTarget]]
+        remote_temp_path=None,  # type: t.Optional[str]
+):
+    """Run integration tests for the specified targets."""
     found = False
     passed = []
     failed = []
@@ -1068,10 +1054,6 @@ def command_integration_filtered(args, targets, all_targets, inventory_path, pre
                 seconds = 3
                 display.warning('SSH service not responding. Waiting %d second(s) before checking again.' % seconds)
                 time.sleep(seconds)
-
-    # Windows is different as Ansible execution is done locally but the host is remote
-    if args.inject_httptester and not isinstance(args, WindowsIntegrationConfig):
-        inject_httptester(args)
 
     start_at_task = args.start_at_task
 
@@ -1119,15 +1101,15 @@ def command_integration_filtered(args, targets, all_targets, inventory_path, pre
 
                         start_time = time.time()
 
+                        if pre_target:
+                            pre_target(target)
+
                         run_setup_targets(args, test_dir, target.setup_always, all_targets_dict, setup_targets_executed, inventory_path, common_temp_path, True)
 
                         if not args.explain:
                             # create a fresh test directory for each test target
                             remove_tree(test_dir)
                             make_dirs(test_dir)
-
-                        if pre_target:
-                            pre_target(target)
 
                         try:
                             if target.script_path:
@@ -1222,131 +1204,153 @@ def command_integration_filtered(args, targets, all_targets, inventory_path, pre
             len(failed), len(passed) + len(failed), '\n'.join(target.name for target in failed)))
 
 
-def start_httptester(args):
-    """
-    :type args: EnvironmentConfig
-    :rtype: str, list[str]
-    """
-
-    # map ports from remote -> localhost -> container
-    # passing through localhost is only used when ansible-test is not already running inside a docker container
-    ports = [
-        dict(
-            remote=8080,
-            container=80,
-        ),
-        dict(
-            remote=8443,
-            container=443,
-        ),
-    ]
-
-    container_id = get_docker_container_id()
-
-    if container_id:
-        display.info('Running in docker container: %s' % container_id, verbosity=1)
-    else:
-        for item in ports:
-            item['localhost'] = get_available_port()
-
-    docker_pull(args, args.httptester)
-
-    httptester_id = run_httptester(args, dict((port['localhost'], port['container']) for port in ports if 'localhost' in port))
-
-    if container_id:
-        container_host = get_docker_container_ip(args, httptester_id)
-        display.info('Found httptester container address: %s' % container_host, verbosity=1)
-    else:
-        container_host = 'localhost'
-
-    ssh_options = []
-
-    for port in ports:
-        ssh_options += ['-R', '%d:%s:%d' % (port['remote'], container_host, port.get('localhost', port['container']))]
-
-    return httptester_id, ssh_options
+def parse_inventory(args, inventory_path):  # type: (IntegrationConfig, str) -> t.Dict[str, t.Any]
+    """Return a dict parsed from the given inventory file."""
+    cmd = ['ansible-inventory', '-i', inventory_path, '--list']
+    env = ansible_environment(args)
+    inventory = json.loads(intercept_command(args, cmd, '', env, capture=True, disable_coverage=True)[0])
+    return inventory
 
 
-def run_httptester(args, ports=None):
-    """
-    :type args: EnvironmentConfig
-    :type ports: dict[int, int] | None
-    :rtype: str
-    """
+def get_hosts(inventory, group_name):  # type: (t.Dict[str, t.Any], str) -> t.Dict[str, t.Dict[str, t.Any]]
+    """Return a dict of hosts from the specified group in the given inventory."""
+    hostvars = inventory.get('_meta', {}).get('hostvars', {})
+    group = inventory.get(group_name, {})
+    host_names = group.get('hosts', [])
+    hosts = dict((name, hostvars[name]) for name in host_names)
+    return hosts
+
+
+def run_pypi_proxy(args):  # type: (EnvironmentConfig) -> t.Tuple[t.Optional[str], t.Optional[str]]
+    """Run a PyPI proxy container, returning the container ID and proxy endpoint."""
+    use_proxy = False
+
+    if args.docker_raw == 'centos6':
+        use_proxy = True  # python 2.6 is the only version available
+
+    if args.docker_raw == 'default':
+        if args.python == '2.6':
+            use_proxy = True  # python 2.6 requested
+        elif not args.python and isinstance(args, (SanityConfig, UnitsConfig, ShellConfig)):
+            use_proxy = True  # multiple versions (including python 2.6) can be used
+
+    if args.docker_raw and args.pypi_proxy:
+        use_proxy = True  # manual override to force proxy usage
+
+    if not use_proxy:
+        return None, None
+
+    proxy_image = 'quay.io/ansible/pypi-test-container:1.0.0'
+    port = 3141
+
     options = [
         '--detach',
+        '-p', '%d:%d' % (port, port),
     ]
 
-    if ports:
-        for localhost_port, container_port in ports.items():
-            options += ['-p', '%d:%d' % (localhost_port, container_port)]
+    docker_pull(args, proxy_image)
 
-    httptester_id = docker_run(args, args.httptester, options=options)[0]
+    container_id = docker_run(args, proxy_image, options=options)
 
-    if args.explain:
-        httptester_id = 'httptester_id'
-    else:
-        httptester_id = httptester_id.strip()
+    container = docker_inspect(args, container_id)
 
-    return httptester_id
+    container_ip = container.get_ip_address()
+
+    if not container_ip:
+        raise Exception('PyPI container IP not available.')
+
+    endpoint = 'http://%s:%d/root/pypi/+simple/' % (container_ip, port)
+
+    return container_id, endpoint
 
 
-def inject_httptester(args):
-    """
-    :type args: CommonConfig
-    """
-    comment = ' # ansible-test httptester\n'
-    append_lines = ['127.0.0.1 %s%s' % (host, comment) for host in HTTPTESTER_HOSTS]
+def configure_pypi_proxy(args):  # type: (CommonConfig) -> None
+    """Configure the environment to use a PyPI proxy, if present."""
+    if not isinstance(args, EnvironmentConfig):
+        return
+
+    if args.pypi_endpoint:
+        configure_pypi_block_access()
+        configure_pypi_proxy_pip(args)
+        configure_pypi_proxy_easy_install(args)
+
+
+def configure_pypi_block_access():  # type: () -> None
+    """Block direct access to PyPI to ensure proxy configurations are always used."""
+    if os.getuid() != 0:
+        display.warning('Skipping custom hosts block for PyPI for non-root user.')
+        return
+
     hosts_path = '/etc/hosts'
-
-    original_lines = read_text_file(hosts_path).splitlines(True)
-
-    if not any(line.endswith(comment) for line in original_lines):
-        write_text_file(hosts_path, ''.join(original_lines + append_lines))
-
-    # determine which forwarding mechanism to use
-    pfctl = find_executable('pfctl', required=False)
-    iptables = find_executable('iptables', required=False)
-
-    if pfctl:
-        kldload = find_executable('kldload', required=False)
-
-        if kldload:
-            try:
-                run_command(args, ['kldload', 'pf'], capture=True)
-            except SubprocessError:
-                pass  # already loaded
-
-        rules = '''
-rdr pass inet proto tcp from any to any port 80 -> 127.0.0.1 port 8080
-rdr pass inet proto tcp from any to any port 443 -> 127.0.0.1 port 8443
+    hosts_block = '''
+127.0.0.1 pypi.org pypi.python.org files.pythonhosted.org
 '''
-        cmd = ['pfctl', '-ef', '-']
 
-        try:
-            run_command(args, cmd, capture=True, data=rules)
-        except SubprocessError:
-            pass  # non-zero exit status on success
+    def hosts_cleanup():
+        display.info('Removing custom PyPI hosts entries: %s' % hosts_path, verbosity=1)
 
-    elif iptables:
-        ports = [
-            (80, 8080),
-            (443, 8443),
-        ]
+        with open(hosts_path) as hosts_file_read:
+            content = hosts_file_read.read()
 
-        for src, dst in ports:
-            rule = ['-o', 'lo', '-p', 'tcp', '--dport', str(src), '-j', 'REDIRECT', '--to-port', str(dst)]
+        content = content.replace(hosts_block, '')
 
-            try:
-                # check for existing rule
-                cmd = ['iptables', '-t', 'nat', '-C', 'OUTPUT'] + rule
-                run_command(args, cmd, capture=True)
-            except SubprocessError:
-                # append rule when it does not exist
-                cmd = ['iptables', '-t', 'nat', '-A', 'OUTPUT'] + rule
-                run_command(args, cmd, capture=True)
-    else:
-        raise ApplicationError('No supported port forwarding mechanism detected.')
+        with open(hosts_path, 'w') as hosts_file_write:
+            hosts_file_write.write(content)
+
+    display.info('Injecting custom PyPI hosts entries: %s' % hosts_path, verbosity=1)
+    display.info('Config: %s\n%s' % (hosts_path, hosts_block), verbosity=3)
+
+    with open(hosts_path, 'a') as hosts_file:
+        hosts_file.write(hosts_block)
+
+    atexit.register(hosts_cleanup)
+
+
+def configure_pypi_proxy_pip(args):  # type: (EnvironmentConfig) -> None
+    """Configure a custom index for pip based installs."""
+    pypi_hostname = urlparse(args.pypi_endpoint)[1].split(':')[0]
+
+    pip_conf_path = os.path.expanduser('~/.pip/pip.conf')
+    pip_conf = '''
+[global]
+index-url = {0}
+trusted-host = {1}
+'''.format(args.pypi_endpoint, pypi_hostname).strip()
+
+    def pip_conf_cleanup():
+        display.info('Removing custom PyPI config: %s' % pip_conf_path, verbosity=1)
+        os.remove(pip_conf_path)
+
+    if os.path.exists(pip_conf_path):
+        raise ApplicationError('Refusing to overwrite existing file: %s' % pip_conf_path)
+
+    display.info('Injecting custom PyPI config: %s' % pip_conf_path, verbosity=1)
+    display.info('Config: %s\n%s' % (pip_conf_path, pip_conf), verbosity=3)
+
+    write_text_file(pip_conf_path, pip_conf, True)
+    atexit.register(pip_conf_cleanup)
+
+
+def configure_pypi_proxy_easy_install(args):  # type: (EnvironmentConfig) -> None
+    """Configure a custom index for easy_install based installs."""
+    pydistutils_cfg_path = os.path.expanduser('~/.pydistutils.cfg')
+    pydistutils_cfg = '''
+[easy_install]
+index_url = {0}
+'''.format(args.pypi_endpoint).strip()
+
+    if os.path.exists(pydistutils_cfg_path):
+        raise ApplicationError('Refusing to overwrite existing file: %s' % pydistutils_cfg_path)
+
+    def pydistutils_cfg_cleanup():
+        display.info('Removing custom PyPI config: %s' % pydistutils_cfg_path, verbosity=1)
+        os.remove(pydistutils_cfg_path)
+
+    display.info('Injecting custom PyPI config: %s' % pydistutils_cfg_path, verbosity=1)
+    display.info('Config: %s\n%s' % (pydistutils_cfg_path, pydistutils_cfg), verbosity=3)
+
+    write_text_file(pydistutils_cfg_path, pydistutils_cfg, True)
+    atexit.register(pydistutils_cfg_cleanup)
 
 
 def run_setup_targets(args, test_dir, target_names, targets_dict, targets_executed, inventory_path, temp_path, always):
@@ -1391,16 +1395,11 @@ def integration_environment(args, target, test_dir, inventory_path, ansible_conf
     """
     env = ansible_environment(args, ansible_config=ansible_config)
 
-    if args.inject_httptester:
-        env.update(dict(
-            HTTPTESTER='1',
-        ))
-
     callback_plugins = ['junit'] + (env_config.callback_plugins or [] if env_config else [])
 
     integration = dict(
         JUNIT_OUTPUT_DIR=ResultType.JUNIT.path,
-        ANSIBLE_CALLBACK_WHITELIST=','.join(sorted(set(callback_plugins))),
+        ANSIBLE_CALLBACKS_ENABLED=','.join(sorted(set(callback_plugins))),
         ANSIBLE_TEST_CI=args.metadata.ci_provider or get_ci_provider().code,
         ANSIBLE_TEST_COVERAGE='check' if args.coverage_check else ('yes' if args.coverage else ''),
         OUTPUT_DIR=test_dir,
@@ -1440,6 +1439,14 @@ def command_integration_script(args, target, test_dir, inventory_path, temp_path
         if cloud_environment:
             env_config = cloud_environment.get_environment_config()
 
+    if env_config:
+        display.info('>>> Environment Config\n%s' % json.dumps(dict(
+            env_vars=env_config.env_vars,
+            ansible_vars=env_config.ansible_vars,
+            callback_plugins=env_config.callback_plugins,
+            module_defaults=env_config.module_defaults,
+        ), indent=4, sort_keys=True), verbosity=3)
+
     with integration_test_environment(args, target, inventory_path) as test_env:
         cmd = ['./%s' % os.path.basename(target.script_path)]
 
@@ -1462,6 +1469,7 @@ def command_integration_script(args, target, test_dir, inventory_path, temp_path
                 cmd += ['-e', '@%s' % config_path]
 
             module_coverage = 'non_local/' not in target.aliases
+
             intercept_command(args, cmd, target_name=target.name, env=env, cwd=cwd, temp_path=temp_path,
                               remote_temp_path=remote_temp_path, module_coverage=module_coverage)
 
@@ -1498,10 +1506,19 @@ def command_integration_role(args, target, start_at_task, test_dir, inventory_pa
         hosts = 'testhost'
         gather_facts = True
 
+    if not isinstance(args, NetworkIntegrationConfig):
         cloud_environment = get_cloud_environment(args, target)
 
         if cloud_environment:
             env_config = cloud_environment.get_environment_config()
+
+    if env_config:
+        display.info('>>> Environment Config\n%s' % json.dumps(dict(
+            env_vars=env_config.env_vars,
+            ansible_vars=env_config.ansible_vars,
+            callback_plugins=env_config.callback_plugins,
+            module_defaults=env_config.module_defaults,
+        ), indent=4, sort_keys=True), verbosity=3)
 
     with integration_test_environment(args, target, inventory_path) as test_env:
         if os.path.exists(test_env.vars_file):
@@ -1561,6 +1578,9 @@ def command_integration_role(args, target, start_at_task, test_dir, inventory_pa
                 # support use of adhoc ansible commands in collections without specifying the fully qualified collection name
                 ANSIBLE_PLAYBOOK_DIR=cwd,
             ))
+
+            if env_config and env_config.env_vars:
+                env.update(env_config.env_vars)
 
             env['ANSIBLE_ROLES_PATH'] = test_env.targets_dir
 
@@ -1927,7 +1947,7 @@ class EnvironmentDescription:
         pip_paths = dict((v, find_executable('pip%s' % v, required=False)) for v in sorted(versions))
         program_versions = dict((v, self.get_version([python_paths[v], version_check], warnings)) for v in sorted(python_paths) if python_paths[v])
         pip_interpreters = dict((v, self.get_shebang(pip_paths[v])) for v in sorted(pip_paths) if pip_paths[v])
-        known_hosts_hash = self.get_hash(os.path.expanduser('~/.ssh/known_hosts'))
+        known_hosts_hash = get_hash(os.path.expanduser('~/.ssh/known_hosts'))
 
         for version in sorted(versions):
             self.check_python_pip_association(version, python_paths, pip_paths, pip_interpreters, warnings)
@@ -1958,16 +1978,8 @@ class EnvironmentDescription:
         pip_path = pip_paths.get(version)
         python_path = python_paths.get(version)
 
-        if not python_path and not pip_path:
-            # neither python or pip is present for this version
-            return
-
-        if not python_path:
-            warnings.append('A %s interpreter was not found, yet a matching pip was found at "%s".' % (python_label, pip_path))
-            return
-
-        if not pip_path:
-            warnings.append('A %s interpreter was found at "%s", yet a matching pip was not found.' % (python_label, python_path))
+        if not python_path or not pip_path:
+            # skip checks when either python or pip are missing for this version
             return
 
         pip_shebang = pip_interpreters.get(version)
@@ -2075,21 +2087,6 @@ class EnvironmentDescription:
         with open_text_file(path) as script_fd:
             return script_fd.readline().strip()
 
-    @staticmethod
-    def get_hash(path):
-        """
-        :type path: str
-        :rtype: str | None
-        """
-        if not os.path.exists(path):
-            return None
-
-        file_hash = hashlib.md5()
-
-        file_hash.update(read_binary_file(path))
-
-        return file_hash.hexdigest()
-
 
 class NoChangesDetected(ApplicationWarning):
     """Exception when change detection was performed, but no changes were found."""
@@ -2105,17 +2102,15 @@ class NoTestsForChanges(ApplicationWarning):
 
 class Delegate(Exception):
     """Trigger command delegation."""
-    def __init__(self, exclude=None, require=None, integration_targets=None):
+    def __init__(self, exclude=None, require=None):
         """
         :type exclude: list[str] | None
         :type require: list[str] | None
-        :type integration_targets: tuple[IntegrationTarget] | None
         """
         super(Delegate, self).__init__()
 
         self.exclude = exclude or []
         self.require = require or []
-        self.integration_targets = integration_targets or tuple()
 
 
 class AllTargetsSkipped(ApplicationWarning):

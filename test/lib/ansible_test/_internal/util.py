@@ -5,6 +5,7 @@ __metaclass__ = type
 import contextlib
 import errno
 import fcntl
+import hashlib
 import inspect
 import os
 import pkgutil
@@ -53,6 +54,7 @@ from .encoding import (
 
 from .io import (
     open_binary_file,
+    read_binary_file,
     read_text_file,
 )
 
@@ -69,6 +71,13 @@ try:
     MAXFD = subprocess.MAXFD
 except AttributeError:
     MAXFD = -1
+
+try:
+    TKey = t.TypeVar('TKey')
+    TValue = t.TypeVar('TValue')
+except AttributeError:
+    TKey = None  # pylint: disable=invalid-name
+    TValue = None  # pylint: disable=invalid-name
 
 COVERAGE_CONFIG_NAME = 'coveragerc'
 
@@ -144,6 +153,11 @@ def read_lines_without_comments(path, remove_blank_lines=False, optional=False):
         lines = [line for line in lines if line]
 
     return lines
+
+
+def exclude_none_values(data):  # type: (t.Dict[TKey, t.Optional[TValue]]) -> t.Dict[TKey, TValue]
+    """Return the provided dictionary with any None values excluded."""
+    return dict((key, value) for key, value in data.items() if value is not None)
 
 
 def find_executable(executable, cwd=None, path=None, required=True):
@@ -363,7 +377,6 @@ def common_environment():
     )
 
     optional = (
-        'HTTPTESTER',
         'LD_LIBRARY_PATH',
         'SSH_AUTH_SOCK',
         # MacOS High Sierra Compatibility
@@ -384,6 +397,14 @@ def common_environment():
         'LDFLAGS',
         'CFLAGS',
     )
+
+    # FreeBSD Compatibility
+    # This is required to include libyaml support in PyYAML.
+    # The header /usr/local/include/yaml.h isn't in the default include path for the compiler.
+    # It is included here so that tests can take advantage of it, rather than only ansible-test during managed pip installs.
+    # If CFLAGS has been set in the environment that value will take precedence due to being an optional var when calling pass_vars.
+    if os.path.exists('/etc/freebsd-update.conf'):
+        env.update(CFLAGS='-I/usr/local/include/')
 
     env.update(pass_vars(required=required, optional=optional))
 
@@ -500,7 +521,7 @@ def is_binary_file(path):
 
     with open_binary_file(path) as path_fd:
         # noinspection PyTypeChecker
-        return b'\0' in path_fd.read(1024)
+        return b'\0' in path_fd.read(4096)
 
 
 def generate_password():
@@ -614,7 +635,7 @@ class Display:
         """
         :type message: str
         :type color: str | None
-        :type fd: file
+        :type fd: t.IO[str]
         :type truncate: bool
         """
         if self.redact and self.sensitive:
@@ -714,18 +735,6 @@ def parse_to_list_of_dict(pattern, value):
     return matched
 
 
-def get_available_port():
-    """
-    :rtype: int
-    """
-    # this relies on the kernel not reusing previously assigned ports immediately
-    socket_fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    with contextlib.closing(socket_fd):
-        socket_fd.bind(('', 0))
-        return socket_fd.getsockname()[1]
-
-
 def get_subclasses(class_type):  # type: (t.Type[C]) -> t.Set[t.Type[C]]
     """Returns the set of types that are concrete subclasses of the given type."""
     subclasses = set()  # type: t.Set[t.Type[C]]
@@ -770,12 +779,12 @@ def paths_to_dirs(paths):  # type: (t.List[str]) -> t.List[str]
     return sorted(dir_names)
 
 
-def str_to_version(version):  # type: (str) -> t.Tuple[int]
+def str_to_version(version):  # type: (str) -> t.Tuple[int, ...]
     """Return a version tuple from a version string."""
     return tuple(int(n) for n in version.split('.'))
 
 
-def version_to_str(version):  # type: (t.Tuple[int]) -> str
+def version_to_str(version):  # type: (t.Tuple[int, ...]) -> str
     """Return a version string from a version tuple."""
     return '.'.join(str(n) for n in version)
 
@@ -814,13 +823,11 @@ def load_module(path, name):  # type: (str, str) -> None
         return
 
     if sys.version_info >= (3, 4):
-        # noinspection PyUnresolvedReferences
         import importlib.util
 
-        # noinspection PyUnresolvedReferences
         spec = importlib.util.spec_from_file_location(name, path)
-        # noinspection PyUnresolvedReferences
         module = importlib.util.module_from_spec(spec)
+        # noinspection PyUnresolvedReferences
         spec.loader.exec_module(module)
 
         sys.modules[name] = module
@@ -848,6 +855,52 @@ def open_zipfile(path, mode='r'):
     zib_obj = zipfile.ZipFile(path, mode=mode)
     yield zib_obj
     zib_obj.close()
+
+
+def sanitize_host_name(name):
+    """Return a sanitized version of the given name, suitable for use as a hostname."""
+    return re.sub('[^A-Za-z0-9]+', '-', name)[:63].strip('-')
+
+
+def devnull():
+    """Return a file descriptor for /dev/null, using a previously cached version if available."""
+    try:
+        return devnull.fd
+    except AttributeError:
+        devnull.fd = os.open('/dev/null', os.O_RDONLY)
+
+    return devnull.fd
+
+
+def get_hash(path):
+    """
+    :type path: str
+    :rtype: str | None
+    """
+    if not os.path.exists(path):
+        return None
+
+    file_hash = hashlib.sha256()
+
+    file_hash.update(read_binary_file(path))
+
+    return file_hash.hexdigest()
+
+
+def get_host_ip():
+    """Return the host's IP address."""
+    try:
+        return get_host_ip.ip
+    except AttributeError:
+        pass
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(('10.255.255.255', 22))
+        host_ip = get_host_ip.ip = sock.getsockname()[0]
+
+    display.info('Detected host IP: %s' % host_ip, verbosity=1)
+
+    return host_ip
 
 
 display = Display()  # pylint: disable=locally-disabled, invalid-name

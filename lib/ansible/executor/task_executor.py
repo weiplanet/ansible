@@ -38,6 +38,8 @@ from ansible.utils.vars import combine_vars, isidentifier
 display = Display()
 
 
+RETURN_VARS = [x for x in C.MAGIC_VARIABLE_MAPPING.items() if 'become' not in x and '_pass' not in x]
+
 __all__ = ['TaskExecutor']
 
 
@@ -120,10 +122,13 @@ class TaskExecutor:
                     # create the overall result item
                     res = dict(results=item_results)
 
-                    # loop through the item results, and set the global changed/failed result flags based on any item.
+                    # loop through the item results and set the global changed/failed/skipped result flags based on any item.
+                    res['skipped'] = True
                     for item in item_results:
                         if 'changed' in item and item['changed'] and not res.get('changed'):
                             res['changed'] = True
+                        if res['skipped'] and ('skipped' not in item or ('skipped' in item and not item['skipped'])):
+                            res['skipped'] = False
                         if 'failed' in item and item['failed']:
                             item_ignore = item.pop('_ansible_ignore_errors')
                             if not res.get('failed'):
@@ -143,8 +148,10 @@ class TaskExecutor:
                                 res[array] = res[array] + item[array]
                                 del item[array]
 
-                    if not res.get('Failed', False):
+                    if not res.get('failed', False):
                         res['msg'] = 'All items completed'
+                    if res['skipped']:
+                        res['msg'] = 'All items skipped'
                 else:
                     res = dict(changed=False, skipped=True, skipped_reason='No items in the list', results=[])
             else:
@@ -207,7 +214,7 @@ class TaskExecutor:
         if self._loader.get_basedir() not in self._job_vars['ansible_search_path']:
             self._job_vars['ansible_search_path'].append(self._loader.get_basedir())
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
+        templar = Templar(loader=self._loader, variables=self._job_vars)
         items = None
         loop_cache = self._job_vars.get('_ansible_loop_cache')
         if loop_cache is not None:
@@ -270,7 +277,7 @@ class TaskExecutor:
         label = None
         loop_pause = 0
         extended = False
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
+        templar = Templar(loader=self._loader, variables=self._job_vars)
 
         # FIXME: move this to the object itself to allow post_validate to take care of templating (loop_control.post_validate)
         if self._task.loop_control:
@@ -375,15 +382,21 @@ class TaskExecutor:
                     'msg': 'Failed to template loop_control.label: %s' % to_text(e)
                 })
 
-            self._final_q.put(
-                TaskResult(
-                    self._host.name,
-                    self._task._uuid,
-                    res,
-                    task_fields=task_fields,
-                ),
-                block=False,
+            tr = TaskResult(
+                self._host.name,
+                self._task._uuid,
+                res,
+                task_fields=task_fields,
             )
+            if tr.is_failed() or tr.is_unreachable():
+                self._final_q.send_callback('v2_runner_item_on_failed', tr)
+            elif tr.is_skipped():
+                self._final_q.send_callback('v2_runner_item_on_skipped', tr)
+            else:
+                if getattr(self._task, 'diff', False):
+                    self._final_q.send_callback('v2_on_file_diff', tr)
+                self._final_q.send_callback('v2_runner_item_on_ok', tr)
+
             results.append(res)
             del task_vars[loop_var]
 
@@ -415,10 +428,14 @@ class TaskExecutor:
         if variables is None:
             variables = self._job_vars
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=variables)
+        templar = Templar(loader=self._loader, variables=variables)
 
         context_validation_error = None
         try:
+            # TODO: remove play_context as this does not take delegation into account, task itself should hold values
+            #  for connection/shell/become/terminal plugin options to finalize.
+            #  Kept for now for backwards compatibility and a few functions that are still exclusive to it.
+
             # apply the given task's information to the connection info,
             # which may override some fields already set by the play or
             # the options specified on the command line
@@ -437,7 +454,6 @@ class TaskExecutor:
             # a certain subset of variables exist.
             self._play_context.update_vars(variables)
 
-            # FIXME: update connection/shell plugin options
         except AnsibleError as e:
             # save the error, which we'll raise later if we don't end up
             # skipping this task during the conditional evaluation step
@@ -470,7 +486,7 @@ class TaskExecutor:
 
         # if this task is a TaskInclude, we just return now with a success code so the
         # main thread can expand the task list for the given host
-        if self._task.action in ('include', 'include_tasks'):
+        if self._task.action in C._ACTION_ALL_INCLUDE_TASKS:
             include_args = self._task.args.copy()
             include_file = include_args.pop('_raw_params', None)
             if not include_file:
@@ -480,7 +496,7 @@ class TaskExecutor:
             return dict(include=include_file, include_args=include_args)
 
         # if this task is a IncludeRole, we just return now with a success code so the main thread can expand the task list for the given host
-        elif self._task.action == 'include_role':
+        elif self._task.action in C._ACTION_INCLUDE_ROLE:
             include_args = self._task.args.copy()
             return dict(include_args=include_args)
 
@@ -500,26 +516,28 @@ class TaskExecutor:
                 variable_params.update(self._task.args)
                 self._task.args = variable_params
 
+        if self._task.delegate_to:
+            # use vars from delegated host (which already include task vars) instead of original host
+            cvars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
+            orig_vars = templar.available_variables
+        else:
+            # just use normal host vars
+            cvars = orig_vars = variables
+
+        templar.available_variables = cvars
+
         # get the connection and the handler for this execution
         if (not self._connection or
                 not getattr(self._connection, 'connected', False) or
                 self._play_context.remote_addr != self._connection._play_context.remote_addr):
-            self._connection = self._get_connection(variables=variables, templar=templar)
+            self._connection = self._get_connection(cvars, templar)
         else:
             # if connection is reused, its _play_context is no longer valid and needs
             # to be replaced with the one templated above, in case other data changed
             self._connection._play_context = self._play_context
 
-        if self._task.delegate_to:
-            # use vars from delegated host (which already include task vars) instead of original host
-            delegated_vars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
-            orig_vars = templar.available_variables
-            templar.available_variables = delegated_vars
-            plugin_vars = self._set_connection_options(delegated_vars, templar)
-            templar.available_variables = orig_vars
-        else:
-            # just use normal host vars
-            plugin_vars = self._set_connection_options(variables, templar)
+        plugin_vars = self._set_connection_options(cvars, templar)
+        templar.available_variables = orig_vars
 
         # get handler
         self._handler = self._get_action_handler(connection=self._connection, templar=templar)
@@ -593,7 +611,6 @@ class TaskExecutor:
             if self._task.async_val > 0:
                 if self._task.poll > 0 and not result.get('skipped') and not result.get('failed'):
                     result = self._poll_async_result(result=result, templar=templar, task_vars=vars_copy)
-                    # FIXME callback 'v2_runner_on_async_poll' here
 
                 # ensure no log is preserved
                 result["_ansible_no_log"] = self._play_context.no_log
@@ -615,13 +632,13 @@ class TaskExecutor:
                     failed_when_result = False
                 return failed_when_result
 
-            if 'ansible_facts' in result:
-                if self._task.action in ('set_fact', 'include_vars'):
+            if 'ansible_facts' in result and self._task.action not in C._ACTION_DEBUG:
+                if self._task.action in C._ACTION_WITH_CLEAN_FACTS:
                     vars_copy.update(result['ansible_facts'])
                 else:
                     # TODO: cleaning of facts should eventually become part of taskresults instead of vars
                     af = wrap_var(result['ansible_facts'])
-                    vars_copy.update(namespace_facts(af))
+                    vars_copy['ansible_facts'] = combine_vars(vars_copy.get('ansible_facts', {}), namespace_facts(af))
                     if C.INJECT_FACTS_AS_VARS:
                         vars_copy.update(clean_facts(af))
 
@@ -665,7 +682,15 @@ class TaskExecutor:
                         result['_ansible_retry'] = True
                         result['retries'] = retries
                         display.debug('Retrying task, attempt %d of %d' % (attempt, retries))
-                        self._final_q.put(TaskResult(self._host.name, self._task._uuid, result, task_fields=self._task.dump_attrs()), block=False)
+                        self._final_q.send_callback(
+                            'v2_runner_retry',
+                            TaskResult(
+                                self._host.name,
+                                self._task._uuid,
+                                result,
+                                task_fields=self._task.dump_attrs()
+                            )
+                        )
                         time.sleep(delay)
                         self._handler = self._get_action_handler(connection=self._connection, templar=templar)
         else:
@@ -679,13 +704,13 @@ class TaskExecutor:
         if self._task.register:
             variables[self._task.register] = result = wrap_var(result)
 
-        if 'ansible_facts' in result:
-            if self._task.action in ('set_fact', 'include_vars'):
+        if 'ansible_facts' in result and self._task.action not in C._ACTION_DEBUG:
+            if self._task.action in C._ACTION_WITH_CLEAN_FACTS:
                 variables.update(result['ansible_facts'])
             else:
                 # TODO: cleaning of facts should eventually become part of taskresults instead of vars
                 af = wrap_var(result['ansible_facts'])
-                variables.update(namespace_facts(af))
+                variables['ansible_facts'] = combine_vars(variables.get('ansible_facts', {}), namespace_facts(af))
                 if C.INJECT_FACTS_AS_VARS:
                     variables.update(clean_facts(af))
 
@@ -697,10 +722,12 @@ class TaskExecutor:
 
         # add the delegated vars to the result, so we can reference them
         # on the results side without having to do any further templating
+        # also now add conneciton vars results when delegating
         if self._task.delegate_to:
             result["_ansible_delegated_vars"] = {'ansible_delegated_host': self._task.delegate_to}
             for k in plugin_vars:
-                result["_ansible_delegated_vars"][k] = delegated_vars.get(k)
+                result["_ansible_delegated_vars"][k] = cvars.get(k)
+
         # and return
         display.debug("attempt loop complete, returning result")
         return result
@@ -728,7 +755,7 @@ class TaskExecutor:
         # we need the 'normal' action handler for the status check, so get it
         # now via the action_loader
         async_handler = self._shared_loader_obj.action_loader.get(
-            'async_status',
+            'ansible.legacy.async_status',
             task=async_task,
             connection=self._connection,
             play_context=self._play_context,
@@ -769,6 +796,15 @@ class TaskExecutor:
                     raise
             else:
                 time_left -= self._task.poll
+                self._final_q.send_callback(
+                    'v2_runner_on_async_poll',
+                    TaskResult(
+                        self._host.name,
+                        async_task,  # We send the full task here, because the controller knows nothing about it, the TE created it
+                        async_result,
+                        task_fields=self._task.dump_attrs(),
+                    ),
+                )
 
         if int(async_result.get('finished', 0)) != 1:
             if async_result.get('_ansible_parsed'):
@@ -776,6 +812,28 @@ class TaskExecutor:
             else:
                 return dict(failed=True, msg="async task produced unparseable results", async_result=async_result)
         else:
+            # If the async task finished, automatically cleanup the temporary
+            # status file left behind.
+            cleanup_task = Task().load(
+                {
+                    'async_status': {
+                        'jid': async_jid,
+                        'mode': 'cleanup',
+                    },
+                    'environment': self._task.environment,
+                }
+            )
+            cleanup_handler = self._shared_loader_obj.action_loader.get(
+                'ansible.legacy.async_status',
+                task=cleanup_task,
+                connection=self._connection,
+                play_context=self._play_context,
+                loader=self._loader,
+                templar=templar,
+                shared_loader_obj=self._shared_loader_obj,
+            )
+            cleanup_handler.run(task_vars=task_vars)
+            cleanup_handler.cleanup(force=True)
             async_handler.cleanup(force=True)
             return async_result
 
@@ -786,23 +844,21 @@ class TaskExecutor:
                                "Use `ansible-doc -t become -l` to list available plugins." % name)
         return become
 
-    def _get_connection(self, variables, templar):
+    def _get_connection(self, cvars, templar):
         '''
         Reads the connection property for the host, and returns the
         correct connection object from the list of connection plugins
         '''
 
-        if self._task.delegate_to is not None:
-            cvars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
-        else:
-            cvars = variables
-
         # use magic var if it exists, if not, let task inheritance do it's thing.
-        self._play_context.connection = cvars.get('ansible_connection', self._task.connection)
+        if cvars.get('ansible_connection') is not None:
+            self._play_context.connection = templar.template(cvars['ansible_connection'])
+        else:
+            self._play_context.connection = self._task.connection
 
-        # TODO: play context has logic to update the conneciton for 'smart'
+        # TODO: play context has logic to update the connection for 'smart'
         # (default value, will chose between ssh and paramiko) and 'persistent'
-        # (really paramiko), evnentually this should move to task object itself.
+        # (really paramiko), eventually this should move to task object itself.
         connection_name = self._play_context.connection
 
         # load connection
@@ -819,8 +875,16 @@ class TaskExecutor:
             raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
 
         # load become plugin if needed
-        if boolean(cvars.get('ansible_become', self._task.become)):
-            become_plugin = self._get_become(cvars.get('ansible_become_method', self._task.become_method))
+        if cvars.get('ansible_become') is not None:
+            become = boolean(templar.template(cvars['ansible_become']))
+        else:
+            become = self._task.become
+
+        if become:
+            if cvars.get('ansible_become_method'):
+                become_plugin = self._get_become(templar.template(cvars['ansible_become_method']))
+            else:
+                become_plugin = self._get_become(self._task.become_method)
 
             try:
                 connection.set_become_plugin(become_plugin)
@@ -847,15 +911,14 @@ class TaskExecutor:
             display.vvvv('attempting to start connection', host=self._play_context.remote_addr)
             display.vvvv('using connection plugin %s' % connection.transport, host=self._play_context.remote_addr)
 
-            options = self._get_persistent_connection_options(connection, variables, templar)
+            options = self._get_persistent_connection_options(connection, cvars, templar)
             socket_path = start_connection(self._play_context, options, self._task._uuid)
             display.vvvv('local domain socket path is %s' % socket_path, host=self._play_context.remote_addr)
             setattr(connection, '_socket_path', socket_path)
 
         return connection
 
-    def _get_persistent_connection_options(self, connection, variables, templar):
-        final_vars = combine_vars(variables, variables.get('ansible_delegated_vars', dict()).get(self._task.delegate_to, dict()))
+    def _get_persistent_connection_options(self, connection, final_vars, templar):
 
         option_vars = C.config.get_plugin_vars('connection', connection._load_name)
         plugin = connection._sub_plugin
@@ -908,6 +971,10 @@ class TaskExecutor:
                     options['_extras'][k] = templar.template(variables[k])
 
         task_keys = self._task.dump_attrs()
+
+        # The task_keys 'timeout' attr is the task's timeout, not the connection timeout.
+        # The connection timeout is threaded through the play_context for now.
+        task_keys['timeout'] = self._play_context.timeout
 
         if self._play_context.password:
             # The connection password is threaded through the play_context for
@@ -962,9 +1029,12 @@ class TaskExecutor:
             handler_name = self._task.action
         elif all((module_prefix in C.NETWORK_GROUP_MODULES, self._shared_loader_obj.action_loader.has_plugin(network_action, collection_list=collections))):
             handler_name = network_action
+            display.vvvv("Using network group action {handler} for {action}".format(handler=handler_name,
+                                                                                    action=self._task.action),
+                         host=self._play_context.remote_addr)
         else:
-            # FUTURE: once we're comfortable with collections impl, preface this action with ansible.builtin so it can't be hijacked
-            handler_name = 'normal'
+            # use ansible.legacy.normal to allow (historic) local action_plugins/ override without collections search
+            handler_name = 'ansible.legacy.normal'
             collections = None  # until then, we don't want the task's collection list to be consulted; use the builtin
 
         handler = self._shared_loader_obj.action_loader.get(
@@ -989,7 +1059,7 @@ def start_connection(play_context, variables, task_uuid):
     Starts the persistent connection
     '''
     candidate_paths = [C.ANSIBLE_CONNECTION_PATH or os.path.dirname(sys.argv[0])]
-    candidate_paths.extend(os.environ['PATH'].split(os.pathsep))
+    candidate_paths.extend(os.environ.get('PATH', '').split(os.pathsep))
     for dirname in candidate_paths:
         ansible_connection = os.path.join(dirname, 'ansible-connection')
         if os.path.isfile(ansible_connection):

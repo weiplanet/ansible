@@ -25,6 +25,7 @@ options:
         When using state=latest, this can be '*' which means run: dnf -y update.
         You can also pass a url or a local path to a rpm file.
         To operate on several packages this can accept a comma separated string of packages or a list of packages."
+      - Comparison operators for package version are valid here C(>), C(<), C(>=), C(<=). Example - C(name>=1.0)
     required: true
     aliases:
         - pkg
@@ -34,6 +35,7 @@ options:
   list:
     description:
       - Various (non-idempotent) commands for usage with C(/usr/bin/ansible) and I(not) playbooks. See examples.
+    type: str
 
   state:
     description:
@@ -41,27 +43,35 @@ options:
       - Default is C(None), however in effect the default action is C(present) unless the C(autoremove) option is
         enabled for this module, then C(absent) is inferred.
     choices: ['absent', 'present', 'installed', 'removed', 'latest']
+    type: str
 
   enablerepo:
     description:
       - I(Repoid) of repositories to enable for the install/update operation.
         These repos will not persist beyond the transaction.
         When specifying multiple repos, separate them with a ",".
+    type: list
+    elements: str
 
   disablerepo:
     description:
       - I(Repoid) of repositories to disable for the install/update operation.
         These repos will not persist beyond the transaction.
         When specifying multiple repos, separate them with a ",".
+    type: list
+    elements: str
 
   conf_file:
     description:
       - The remote dnf configuration file to use for the transaction.
+    type: str
 
   disable_gpg_check:
     description:
       - Whether to disable the GPG checking of signatures of packages being
         installed. Has an effect only if state is I(present) or I(latest).
+      - This setting affects packages installed from a repository as well as
+        "local" packages installed from the filesystem or a URL.
     type: bool
     default: 'no'
 
@@ -71,12 +81,14 @@ options:
         will be installed.
     version_added: "2.3"
     default: "/"
+    type: str
 
   releasever:
     description:
       - Specifies an alternative release from which all packages will be
         installed.
     version_added: "2.6"
+    type: str
 
   autoremove:
     description:
@@ -91,6 +103,8 @@ options:
       - Package name(s) to exclude when state=present, or latest. This can be a
         list or a comma separated string.
     version_added: "2.7"
+    type: list
+    elements: str
   skip_broken:
     description:
       - Skip packages with broken dependencies(devsolve) and are causing problems.
@@ -115,12 +129,14 @@ options:
   security:
     description:
       - If set to C(yes), and C(state=latest) then only installs updates that have been marked security related.
+      - Note that, similar to ``dnf upgrade-minimal``, this filter applies to dependencies as well.
     type: bool
     default: "no"
     version_added: "2.7"
   bugfix:
     description:
       - If set to C(yes), and C(state=latest) then only installs updates that have been marked bugfix related.
+      - Note that, similar to ``dnf upgrade-minimal``, this filter applies to dependencies as well.
     default: "no"
     type: bool
     version_added: "2.7"
@@ -129,11 +145,15 @@ options:
       - I(Plugin) name to enable for the install/update operation.
         The enabled plugin will not persist beyond the transaction.
     version_added: "2.7"
+    type: list
+    elements: str
   disable_plugin:
     description:
       - I(Plugin) name to disable for the install/update operation.
         The disabled plugins will not persist beyond the transaction.
     version_added: "2.7"
+    type: list
+    elements: str
   disable_excludes:
     description:
       - Disable the excludes defined in DNF config files.
@@ -141,6 +161,7 @@ options:
       - If set to C(main), disable excludes defined in [main] in dnf.conf.
       - If set to C(repoid), disable excludes defined for given repo id.
     version_added: "2.7"
+    type: str
   validate_certs:
     description:
       - This only applies if using a https url as the source of the rpm. e.g. for localinstall. If set to C(no), the SSL certificates will not be validated.
@@ -200,6 +221,19 @@ options:
     type: bool
     default: "no"
     version_added: "2.10"
+  nobest:
+    description:
+      - Set best option to False, so that transactions are not limited to best candidates only.
+    required: false
+    type: bool
+    default: "no"
+    version_added: "2.11"
+  cacheonly:
+    description:
+      - Tells dnf to run entirely from system cache; does not download or update metadata.
+    type: bool
+    default: "no"
+    version_added: "2.12"
 notes:
   - When used with a `loop:` each package will be processed individually, it is much more efficient to pass the list directly to the `name` option.
   - Group removal doesn't work if the group was installed with Ansible because
@@ -222,6 +256,11 @@ EXAMPLES = '''
   dnf:
     name: httpd
     state: latest
+
+- name: Install Apache >= 2.4
+  dnf:
+    name: httpd>=2.4
+    state: present
 
 - name: Install the latest version of Apache and MariaDB
   dnf:
@@ -291,6 +330,15 @@ import os
 import re
 import sys
 
+from ansible.module_utils._text import to_native, to_text
+from ansible.module_utils.urls import fetch_file
+from ansible.module_utils.six import PY2, text_type
+from distutils.version import LooseVersion
+
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.common.respawn import has_respawned, probe_interpreters_for_module, respawn_module
+from ansible.module_utils.yumdnf import YumDnf, yumdnf_argument_spec
+
 try:
     import dnf
     import dnf.cli
@@ -301,14 +349,6 @@ try:
     HAS_DNF = True
 except ImportError:
     HAS_DNF = False
-
-from ansible.module_utils._text import to_native, to_text
-from ansible.module_utils.urls import fetch_file
-from ansible.module_utils.six import PY2, text_type
-from distutils.version import LooseVersion
-
-from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.yumdnf import YumDnf, yumdnf_argument_spec
 
 
 class DnfModule(YumDnf):
@@ -331,6 +371,7 @@ class DnfModule(YumDnf):
 
         # DNF specific args that are not part of YumDnf
         self.allowerasing = self.module.params['allowerasing']
+        self.nobest = self.module.params['nobest']
 
     def is_lockfile_pid_valid(self):
         # FIXME? it looks like DNF takes care of invalid lock files itself?
@@ -475,40 +516,31 @@ class DnfModule(YumDnf):
         return rc
 
     def _ensure_dnf(self):
-        if not HAS_DNF:
-            if PY2:
-                package = 'python2-dnf'
-            else:
-                package = 'python3-dnf'
+        if HAS_DNF:
+            return
 
-            if self.module.check_mode:
-                self.module.fail_json(
-                    msg="`{0}` is not installed, but it is required"
-                    "for the Ansible dnf module.".format(package),
-                    results=[],
-                )
+        system_interpreters = ['/usr/libexec/platform-python',
+                               '/usr/bin/python3',
+                               '/usr/bin/python2',
+                               '/usr/bin/python']
 
-            rc, stdout, stderr = self.module.run_command(['dnf', 'install', '-y', package])
-            global dnf
-            try:
-                import dnf
-                import dnf.cli
-                import dnf.const
-                import dnf.exceptions
-                import dnf.subject
-                import dnf.util
-            except ImportError:
-                self.module.fail_json(
-                    msg="Could not import the dnf python module using {0} ({1}). "
-                        "Please install `{2}` package or ensure you have specified the "
-                        "correct ansible_python_interpreter.".format(sys.executable, sys.version.replace('\n', ''),
-                                                                     package),
-                    results=[],
-                    cmd='dnf install -y {0}'.format(package),
-                    rc=rc,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
+        if not has_respawned():
+            # probe well-known system Python locations for accessible bindings, favoring py3
+            interpreter = probe_interpreters_for_module(system_interpreters, 'dnf')
+
+            if interpreter:
+                # respawn under the interpreter where the bindings should be found
+                respawn_module(interpreter)
+                # end of the line for this module, the process will exit here once the respawned module completes
+
+        # done all we can do, something is just broken (auto-install isn't useful anymore with respawn, so it was removed)
+        self.module.fail_json(
+            msg="Could not import the dnf python module using {0} ({1}). "
+                "Please install `python3-dnf` or `python2-dnf` package or ensure you have specified the "
+                "correct ansible_python_interpreter. (attempted {2})"
+                .format(sys.executable, sys.version.replace('\n', ''), system_interpreters),
+            results=[]
+        )
 
     def _configure_base(self, base, conf_file, disable_gpg_check, installroot='/'):
         """Configure the dnf Base object."""
@@ -574,10 +606,17 @@ class DnfModule(YumDnf):
         if self.skip_broken:
             conf.strict = 0
 
+        # Set best
+        if self.nobest:
+            conf.best = 0
+
         if self.download_only:
             conf.downloadonly = True
             if self.download_dir:
                 conf.destdir = self.download_dir
+
+        if self.cacheonly:
+            conf.cacheonly = True
 
         # Default in dnf upstream is true
         conf.clean_requirements_on_remove = self.autoremove
@@ -640,12 +679,16 @@ class DnfModule(YumDnf):
                 results=[],
                 rc=1
             )
+
+        filters = []
         if self.bugfix:
             key = {'advisory_type__eq': 'bugfix'}
-            base._update_security_filters = [base.sack.query().filter(**key)]
+            filters.append(base.sack.query().upgrades().filter(**key))
         if self.security:
             key = {'advisory_type__eq': 'security'}
-            base._update_security_filters = [base.sack.query().filter(**key)]
+            filters.append(base.sack.query().upgrades().filter(**key))
+        if filters:
+            base._update_security_filters = filters
 
         return base
 
@@ -1113,21 +1156,11 @@ class DnfModule(YumDnf):
                                 response['results'].append(handled_remove_error)
                         continue
 
-                    installed_pkg = list(map(str, installed.filter(name=pkg_spec).run()))
-                    if installed_pkg:
-                        candidate_pkg = self._packagename_dict(installed_pkg[0])
-                        installed_pkg = installed.filter(name=candidate_pkg['name']).run()
-                    else:
-                        candidate_pkg = self._packagename_dict(pkg_spec)
-                        installed_pkg = installed.filter(nevra=pkg_spec).run()
-                    if installed_pkg:
-                        installed_pkg = installed_pkg[0]
-                        evr_cmp = self._compare_evr(
-                            installed_pkg.epoch, installed_pkg.version, installed_pkg.release,
-                            candidate_pkg['epoch'], candidate_pkg['version'], candidate_pkg['release'],
-                        )
-                        if evr_cmp == 0:
-                            self.base.remove(pkg_spec)
+                    installed_pkg = dnf.subject.Subject(pkg_spec).get_best_query(
+                        sack=self.base.sack).installed().run()
+
+                    for pkg in installed_pkg:
+                        self.base.remove(str(pkg))
 
                 # Like the dnf CLI we want to allow recursive removal of dependent
                 # packages
@@ -1146,6 +1179,18 @@ class DnfModule(YumDnf):
                 self.module.exit_json(**response)
             else:
                 response['changed'] = True
+
+                # If packages got installed/removed, add them to the results.
+                # We do this early so we can use it for both check_mode and not.
+                if self.download_only:
+                    install_action = 'Downloaded'
+                else:
+                    install_action = 'Installed'
+                for package in self.base.transaction.install_set:
+                    response['results'].append("{0}: {1}".format(install_action, package))
+                for package in self.base.transaction.remove_set:
+                    response['results'].append("Removed: {0}".format(package))
+
                 if failure_response['failures']:
                     failure_response['msg'] = 'Failed to install some of the specified packages'
                     self.module.fail_json(**failure_response)
@@ -1165,16 +1210,32 @@ class DnfModule(YumDnf):
                         results=[],
                     )
 
-                if self.download_only:
+                # Validate GPG. This is NOT done in dnf.Base (it's done in the
+                # upstream CLI subclass of dnf.Base)
+                if not self.disable_gpg_check:
                     for package in self.base.transaction.install_set:
-                        response['results'].append("Downloaded: {0}".format(package))
+                        fail = False
+                        gpgres, gpgerr = self.base._sig_check_pkg(package)
+                        if gpgres == 0:  # validated successfully
+                            continue
+                        elif gpgres == 1:  # validation failed, install cert?
+                            try:
+                                self.base._get_key_for_package(package)
+                            except dnf.exceptions.Error as e:
+                                fail = True
+                        else:  # fatal error
+                            fail = True
+
+                        if fail:
+                            msg = 'Failed to validate GPG signature for {0}'.format(package)
+                            self.module.fail_json(msg)
+
+                if self.download_only:
+                    # No further work left to do, and the results were already updated above.
+                    # Just return them.
                     self.module.exit_json(**response)
                 else:
                     self.base.do_transaction()
-                    for package in self.base.transaction.install_set:
-                        response['results'].append("Installed: {0}".format(package))
-                    for package in self.base.transaction.remove_set:
-                        response['results'].append("Removed: {0}".format(package))
 
                 if failure_response['failures']:
                     failure_response['msg'] = 'Failed to install some of the specified packages'
@@ -1273,6 +1334,7 @@ def main():
     # Extend yumdnf_argument_spec with dnf-specific features that will never be
     # backported to yum because yum is now in "maintenance mode" upstream
     yumdnf_argument_spec['argument_spec']['allowerasing'] = dict(default=False, type='bool')
+    yumdnf_argument_spec['argument_spec']['nobest'] = dict(default=False, type='bool')
 
     module = AnsibleModule(
         **yumdnf_argument_spec

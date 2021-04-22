@@ -19,7 +19,7 @@ requirements:
 - groupmod
 description:
     - Manage presence of groups on a host.
-    - For Windows targets, use the M(win_group) module instead.
+    - For Windows targets, use the M(ansible.windows.win_group) module instead.
 options:
     name:
         description:
@@ -45,7 +45,7 @@ options:
         description:
             - Forces the use of "local" command alternatives on platforms that implement it.
             - This is useful in environments that use centralized authentication when you want to manipulate the local groups.
-              (e.g. it uses C(lgroupadd) instead of C(groupadd)).
+              (for example, it uses C(lgroupadd) instead of C(groupadd)).
             - This requires that these commands exist on the targeted host, otherwise it will be a fatal error.
         type: bool
         default: no
@@ -58,24 +58,25 @@ options:
         default: no
         version_added: "2.8"
 seealso:
-- module: user
-- module: win_group
+- module: ansible.builtin.user
+- module: ansible.windows.win_group
 author:
 - Stephen Fromm (@sfromm)
+notes:
+- Supports C(check_mode).
 '''
 
 EXAMPLES = '''
 - name: Ensure group "somegroup" exists
-  group:
+  ansible.builtin.group:
     name: somegroup
     state: present
 
 - name: Ensure group "docker" exists with correct gid
-  group:
+  ansible.builtin.group:
     name: docker
     state: present
     gid: 1750
-
 '''
 
 RETURN = r'''
@@ -85,17 +86,17 @@ gid:
   type: int
   sample: 1001
 name:
-  description: Group name
+  description: Group name.
   returned: always
   type: str
   sample: users
 state:
-  description: Whether the group is present or not
+  description: Whether the group is present or not.
   returned: always
   type: str
   sample: 'absent'
 system:
-  description: Whether the group is a system group or not
+  description: Whether the group is a system group or not.
   returned: When C(state) is 'present'
   type: bool
   sample: False

@@ -20,15 +20,12 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 import base64
-import crypt
 import glob
 import hashlib
-import itertools
 import json
 import ntpath
 import os.path
 import re
-import string
 import sys
 import time
 import uuid
@@ -41,11 +38,12 @@ from random import Random, SystemRandom, shuffle
 from jinja2.filters import environmentfilter, do_groupby as _do_groupby
 
 from ansible.errors import AnsibleError, AnsibleFilterError, AnsibleFilterTypeError
-from ansible.module_utils.six import iteritems, string_types, integer_types, reraise
-from ansible.module_utils.six.moves import reduce, shlex_quote
+from ansible.module_utils.six import string_types, integer_types, reraise, text_type
+from ansible.module_utils.six.moves import shlex_quote
 from ansible.module_utils._text import to_bytes, to_native, to_text
 from ansible.module_utils.common.collections import is_sequence
 from ansible.module_utils.common._collections_compat import Mapping
+from ansible.module_utils.common.yaml import yaml_load, yaml_load_all
 from ansible.parsing.ajson import AnsibleJSONEncoder
 from ansible.parsing.yaml.dumper import AnsibleDumper
 from ansible.template import recursive_check_defined
@@ -102,7 +100,7 @@ def strftime(string_format, second=None):
     ''' return a date string using string. See https://docs.python.org/2/library/time.html#time.strftime for format '''
     if second is not None:
         try:
-            second = int(second)
+            second = float(second)
         except Exception:
             raise AnsibleFilterError('Invalid value for epoch value (%s)' % second)
     return time.strftime(string_format, time.localtime(second))
@@ -110,6 +108,8 @@ def strftime(string_format, second=None):
 
 def quote(a):
     ''' return its argument quoted for shell usage '''
+    if a is None:
+        a = u''
     return shlex_quote(to_text(a))
 
 
@@ -209,13 +209,19 @@ def regex_escape(string, re_type='python'):
 
 def from_yaml(data):
     if isinstance(data, string_types):
-        return yaml.safe_load(data)
+        # The ``text_type`` call here strips any custom
+        # string wrapper class, so that CSafeLoader can
+        # read the data
+        return yaml_load(text_type(to_text(data, errors='surrogate_or_strict')))
     return data
 
 
 def from_yaml_all(data):
     if isinstance(data, string_types):
-        return yaml.safe_load_all(data)
+        # The ``text_type`` call here strips any custom
+        # string wrapper class, so that CSafeLoader can
+        # read the data
+        return yaml_load_all(text_type(to_text(data, errors='surrogate_or_strict')))
     return data
 
 
@@ -660,4 +666,5 @@ class FilterModule(object):
             'dict2items': dict_to_list_of_dict_key_value_elements,
             'items2dict': list_of_dict_key_value_elements_to_dict,
             'subelements': subelements,
+            'split': partial(unicode_wrap, text_type.split),
         }

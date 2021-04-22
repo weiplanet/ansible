@@ -15,7 +15,7 @@ ansible-playbook from_handlers.yml -i inventory.handlers -v "$@" --tags scenario
 ansible-playbook test_listening_handlers.yml -i inventory.handlers -v "$@"
 
 [ "$(ansible-playbook test_handlers.yml -i inventory.handlers -v "$@" --tags scenario2 -l A \
-| grep -E -o 'RUNNING HANDLER \[test_handlers : .*?]')" = "RUNNING HANDLER [test_handlers : test handler]" ]
+| grep -E -o 'RUNNING HANDLER \[test_handlers : .*]')" = "RUNNING HANDLER [test_handlers : test handler]" ]
 
 # Test forcing handlers using the linear and free strategy
 for strategy in linear free; do
@@ -55,13 +55,13 @@ for strategy in linear free; do
 done
 
 [ "$(ansible-playbook test_handlers_include.yml -i ../../inventory -v "$@" --tags playbook_include_handlers \
-| grep -E -o 'RUNNING HANDLER \[.*?]')" = "RUNNING HANDLER [test handler]" ]
+| grep -E -o 'RUNNING HANDLER \[.*]')" = "RUNNING HANDLER [test handler]" ]
 
 [ "$(ansible-playbook test_handlers_include.yml -i ../../inventory -v "$@" --tags role_include_handlers \
-| grep -E -o 'RUNNING HANDLER \[test_handlers_include : .*?]')" = "RUNNING HANDLER [test_handlers_include : test handler]" ]
+| grep -E -o 'RUNNING HANDLER \[test_handlers_include : .*]')" = "RUNNING HANDLER [test_handlers_include : test handler]" ]
 
 [ "$(ansible-playbook test_handlers_include_role.yml -i ../../inventory -v "$@" \
-| grep -E -o 'RUNNING HANDLER \[test_handlers_include_role : .*?]')" = "RUNNING HANDLER [test_handlers_include_role : test handler]" ]
+| grep -E -o 'RUNNING HANDLER \[test_handlers_include_role : .*]')" = "RUNNING HANDLER [test_handlers_include_role : test handler]" ]
 
 # Notify handler listen
 ansible-playbook test_handlers_listen.yml -i inventory.handlers -v "$@"
@@ -86,6 +86,9 @@ set -e
 
 # https://github.com/ansible/ansible/issues/47287
 [ "$(ansible-playbook test_handlers_including_task.yml -i ../../inventory -v "$@" | grep -E -o 'failed=[0-9]+')" = "failed=0" ]
+
+# https://github.com/ansible/ansible/issues/71222
+ansible-playbook test_role_handlers_including_tasks.yml -i ../../inventory -v "$@"
 
 # https://github.com/ansible/ansible/issues/27237
 set +e

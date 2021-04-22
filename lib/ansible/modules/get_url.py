@@ -18,14 +18,13 @@ description:
      - By default, if an environment variable C(<protocol>_proxy) is set on
        the target host, requests will be sent through that proxy. This
        behaviour can be overridden by setting a variable for this task
-       (see `setting the environment
-       <https://docs.ansible.com/playbooks_environment.html>`_),
+       (see R(setting the environment,playbooks_environment)),
        or by using the use_proxy option.
      - HTTP redirects can redirect from HTTP to HTTPS so you should be sure that
        your proxy environment for both protocols is correct.
      - From Ansible 2.4 when run with C(--check), it will do a HEAD request to validate the URL but
        will not download the entire file or verify it against hashes.
-     - For Windows targets, use the M(win_get_url) module instead.
+     - For Windows targets, use the M(ansible.windows.win_get_url) module instead.
 version_added: '0.6'
 options:
   url:
@@ -78,6 +77,7 @@ options:
         This option is deprecated and will be removed in version 2.14. Use
         option C(checksum) instead.
     default: ''
+    type: str
     version_added: "1.3"
   checksum:
     description:
@@ -165,14 +165,25 @@ options:
       - Header to identify as, generally appears in web server logs.
     type: str
     default: ansible-httpget
+  use_gssapi:
+    description:
+      - Use GSSAPI to perform the authentication, typically this is for Kerberos or Kerberos through Negotiate
+        authentication.
+      - Requires the Python library L(gssapi,https://github.com/pythongssapi/python-gssapi) to be installed.
+      - Credentials for GSSAPI can be specified with I(url_username)/I(url_password) or with the GSSAPI env var
+        C(KRB5CCNAME) that specified a custom Kerberos credential cache.
+      - NTLM authentication is C(not) supported even if the GSSAPI mech for NTLM has been installed.
+    type: bool
+    default: no
+    version_added: '2.11'
 # informational: requirements for nodes
 extends_documentation_fragment:
     - files
 notes:
-     - For Windows targets, use the M(win_get_url) module instead.
+     - For Windows targets, use the M(ansible.windows.win_get_url) module instead.
 seealso:
-- module: uri
-- module: win_get_url
+- module: ansible.builtin.uri
+- module: ansible.windows.win_get_url
 author:
 - Jan-Piet Mens (@jpmens)
 '''
@@ -346,16 +357,12 @@ def url_filename(url):
     return fn
 
 
-def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest=''):
+def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET'):
     """
     Download data from the url and store in a temporary file.
 
     Return (tempfile, info about the request)
     """
-    if module.check_mode:
-        method = 'HEAD'
-    else:
-        method = 'GET'
 
     start = datetime.datetime.utcnow()
     rsp, info = fetch_url(module, url, use_proxy=use_proxy, force=force, last_mod_time=last_mod_time, timeout=timeout, headers=headers, method=method)
@@ -416,6 +423,14 @@ def extract_filename_from_headers(headers):
     return res
 
 
+def is_url(checksum):
+    """
+    Returns True if checksum value has supported URL scheme, else False."""
+    supported_schemes = ('http', 'https', 'ftp', 'file')
+
+    return urlsplit(checksum).scheme in supported_schemes
+
+
 # ==============================================================
 # main
 
@@ -429,7 +444,7 @@ def main():
     argument_spec.update(
         url=dict(type='str', required=True),
         dest=dict(type='path', required=True),
-        backup=dict(type='bool'),
+        backup=dict(type='bool', default=False),
         sha256sum=dict(type='str', default=''),
         checksum=dict(type='str', default=''),
         timeout=dict(type='int', default=10),
@@ -487,23 +502,23 @@ def main():
         except ValueError:
             module.fail_json(msg="The checksum parameter has to be in format <algorithm>:<checksum>", **result)
 
-        if checksum.startswith('http://') or checksum.startswith('https://') or checksum.startswith('ftp://'):
+        if is_url(checksum):
             checksum_url = checksum
             # download checksum file to checksum_tmpsrc
             checksum_tmpsrc, checksum_info = url_get(module, checksum_url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest)
             with open(checksum_tmpsrc) as f:
                 lines = [line.rstrip('\n') for line in f]
             os.remove(checksum_tmpsrc)
-            checksum_map = {}
+            checksum_map = []
             for line in lines:
                 parts = line.split(None, 1)
                 if len(parts) == 2:
-                    checksum_map[parts[0]] = parts[1]
+                    checksum_map.append((parts[0], parts[1]))
             filename = url_filename(url)
 
             # Look through each line in the checksum file for a hash corresponding to
             # the filename in the url, returning the first hash that is found.
-            for cksum in (s for (s, f) in checksum_map.items() if f.strip('./') == filename):
+            for cksum in (s for (s, f) in checksum_map if f.strip('./') == filename):
                 checksum = cksum
                 break
             else:
@@ -553,7 +568,8 @@ def main():
 
     # download to tmpsrc
     start = datetime.datetime.utcnow()
-    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest)
+    method = 'HEAD' if module.check_mode else 'GET'
+    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method)
     result['elapsed'] = (datetime.datetime.utcnow() - start).seconds
     result['src'] = tmpsrc
 
@@ -610,7 +626,7 @@ def main():
             if backup:
                 if os.path.exists(dest):
                     backup_file = module.backup_local(dest)
-            module.atomic_move(tmpsrc, dest)
+            module.atomic_move(tmpsrc, dest, unsafe_writes=module.params['unsafe_writes'])
         except Exception as e:
             if os.path.exists(tmpsrc):
                 os.remove(tmpsrc)

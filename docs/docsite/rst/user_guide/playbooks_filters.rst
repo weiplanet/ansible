@@ -4,7 +4,7 @@
 Using filters to manipulate data
 ********************************
 
-Filters let you transform JSON data into YAML data, split a URL to extract the hostname, get the SHA1 hash of a string, add or multiply integers, and much more. You can use the Ansible-specific filters documented here to manipulate your data, or use any of the standard filters shipped with Jinja2 - see the list of :ref:`built-in filters <jinja2:builtin-filters>` in the official Jinja2 template documentation. You can also use :ref:`Python methods <jinja2:python-methods>` to transform data. You can :ref:`create custom Ansible filters as plugins <developing_filter_plugins>`, though we generally welcome new filters into the ansible-base repo so everyone can use them.
+Filters let you transform JSON data into YAML data, split a URL to extract the hostname, get the SHA1 hash of a string, add or multiply integers, and much more. You can use the Ansible-specific filters documented here to manipulate your data, or use any of the standard filters shipped with Jinja2 - see the list of :ref:`built-in filters <jinja2:builtin-filters>` in the official Jinja2 template documentation. You can also use :ref:`Python methods <jinja2:python-methods>` to transform data. You can :ref:`create custom Ansible filters as plugins <developing_filter_plugins>`, though we generally welcome new filters into the ansible-core repo so everyone can use them.
 
 Because templating happens on the Ansible controller, **not** on the target host, filters execute on the controller and transform data locally.
 
@@ -28,7 +28,7 @@ You can provide default values for variables directly in your templates using th
 In the above example, if the variable 'some_variable' is not defined, Ansible uses the default value 5, rather than raising an "undefined variable" error and failing. If you are working within a role, you can also add a ``defaults/main.yml`` to define the default values for variables in your role.
 
 Beginning in version 2.8, attempting to access an attribute of an Undefined value in Jinja will return another Undefined value, rather than throwing an error immediately. This means that you can now simply use
-a default with a value in a nested data structure (i.e :code:`{{ foo.bar.baz | default('DEFAULT') }}`) when you do not know if the intermediate values are defined.
+a default with a value in a nested data structure (in other words, :code:`{{ foo.bar.baz | default('DEFAULT') }}`) when you do not know if the intermediate values are defined.
 
 If you want to use the default value when variables evaluate to false or an empty string you have to set the second parameter to ``true``::
 
@@ -41,8 +41,8 @@ Making variables optional
 
 By default Ansible requires values for all variables in a templated expression. However, you can make specific variables optional. For example, you might want to use a system default for some items and control the value for others. To make a variable optional, set the default value to the special variable ``omit``::
 
-    - name: touch files with an optional mode
-      file:
+    - name: Touch files with an optional mode
+      ansible.builtin.file:
         dest: "{{ item.path }}"
         state: touch
         mode: "{{ item.mode | default(omit) }}"
@@ -55,14 +55,14 @@ By default Ansible requires values for all variables in a templated expression. 
 In this example, the default mode for the files ``/tmp/foo`` and ``/tmp/bar`` is determined by the umask of the system. Ansible does not send a value for ``mode``. Only the third file, ``/tmp/baz``, receives the `mode=0444` option.
 
 .. note:: If you are "chaining" additional filters after the ``default(omit)`` filter, you should instead do something like this:
-      ``"{{ foo | default(None) | some_filter or omit }}"``. In this example, the default ``None`` (Python null) value will cause the later filters to fail, which will trigger the ``or omit`` portion of the logic. Using ``omit`` in this manner is very specific to the later filters you're chaining though, so be prepared for some trial and error if you do this.
+      ``"{{ foo | default(None) | some_filter or omit }}"``. In this example, the default ``None`` (Python null) value will cause the later filters to fail, which will trigger the ``or omit`` portion of the logic. Using ``omit`` in this manner is very specific to the later filters you are chaining though, so be prepared for some trial and error if you do this.
 
 .. _forcing_variables_to_be_defined:
 
 Defining mandatory values
 -------------------------
 
-If you configure Ansible to ignore undefined variables, you may want to define some values as mandatory. By default, Ansible fails if a variable in your playbook or command is undefined. You can configure Ansible to allow undefined variables by setting :ref:`DEFAULT_UNDEFINED_VAR_BEHAVIOR` to ``false``. In that case, you may want to require some variables to be defined. You can do with this with::
+If you configure Ansible to ignore undefined variables, you may want to define some values as mandatory. By default, Ansible fails if a variable in your playbook or command is undefined. You can configure Ansible to allow undefined variables by setting :ref:`DEFAULT_UNDEFINED_VAR_BEHAVIOR` to ``false``. In that case, you may want to require some variables to be defined. You can do this with::
 
     {{ variable | mandatory }}
 
@@ -146,7 +146,7 @@ Transforming lists into dictionaries
 
 .. versionadded:: 2.7
 
-Use the ``items2dict``filter to transform a list into a dictionary, mapping the content into ``key: value`` pairs::
+Use the ``items2dict`` filter to transform a list into a dictionary, mapping the content into ``key: value`` pairs::
 
     {{ tags | items2dict }}
 
@@ -234,11 +234,31 @@ If you are reading in some already formatted data::
 for example::
 
   tasks:
-    - shell: cat /some/path/to/file.json
+    - name: Register JSON output as a variable
+      ansible.builtin.shell: cat /some/path/to/file.json
       register: result
 
-    - set_fact:
+    - name: Set a variable
+      ansible.builtin.set_fact:
         myvar: "{{ result.stdout | from_json }}"
+
+
+Filter `to_json` and Unicode support
+------------------------------------
+
+By default `to_json` and `to_nice_json` will convert data received to ASCII, so::
+
+    {{ 'München'| to_json }}
+
+will return::
+
+    'M\u00fcnchen'
+
+To keep Unicode characters, pass the parameter `ensure_ascii=False` to the filter::
+
+    {{ 'München'| to_json(ensure_ascii=False) }}
+
+    'München'
 
 .. versionadded:: 2.7
 
@@ -248,9 +268,12 @@ The ``from_yaml_all`` filter will return a generator of parsed YAML documents.
 for example::
 
   tasks:
-    - shell: cat /some/path/to/multidoc-file.yaml
+    - name: Register a file content as a variable
+      ansible.builtin.shell: cat /some/path/to/multidoc-file.yaml
       register: result
-    - debug:
+
+    - name: Print the transformed variable
+      ansible.builtin.debug:
         msg: '{{ item }}'
       loop: '{{ result.stdout | from_yaml_all | list }}'
 
@@ -268,19 +291,25 @@ Combining items from multiple lists: zip and zip_longest
 
 To get a list combining the elements of other lists use ``zip``::
 
-    - name: give me list combo of two lists
-      debug:
-       msg: "{{ [1,2,3,4,5] | zip(['a','b','c','d','e','f']) | list }}"
+    - name: Give me list combo of two lists
+      ansible.builtin.debug:
+       msg: "{{ [1,2,3,4,5,6] | zip(['a','b','c','d','e','f']) | list }}"
 
-    - name: give me shortest combo of two lists
-      debug:
+    # => [[1, "a"], [2, "b"], [3, "c"], [4, "d"], [5, "e"], [6, "f"]]
+
+    - name: Give me shortest combo of two lists
+      ansible.builtin.debug:
         msg: "{{ [1,2,3] | zip(['a','b','c','d','e','f']) | list }}"
+
+    # => [[1, "a"], [2, "b"], [3, "c"]]
 
 To always exhaust all lists use ``zip_longest``::
 
-    - name: give me longest combo of three lists , fill with X
-      debug:
+    - name: Give me longest combo of three lists , fill with X
+      ansible.builtin.debug:
         msg: "{{ [1,2,3] | zip_longest(['a','b','c','d','e','f'], [21, 22, 23], fillvalue='X') | list }}"
+
+    # => [[1, "a", 21], [2, "b", 22], [3, "c", 23], ["X", "d", "X"], ["X", "e", "X"], ["X", "f", "X"]]
 
 Similarly to the output of the ``items2dict`` filter mentioned above, these filters can be used to construct a ``dict``::
 
@@ -295,7 +324,7 @@ List data (before applying the ``zip`` filter)::
       - apple
       - orange
 
-Dictonary data (after applying the ``zip`` filter)::
+Dictionary data (after applying the ``zip`` filter)::
 
     one: apple
     two: orange
@@ -356,7 +385,7 @@ Data after applying the ``subelements`` filter::
 You can use the transformed data with ``loop`` to iterate over the same subelement for multiple objects::
 
     - name: Set authorized ssh key, extracting just that data from 'users'
-      authorized_key:
+      ansible.posix.authorized_key:
         user: "{{ item.0.name }}"
         key: "{{ lookup('file', item.1) }}"
       loop: "{{ users | subelements('authorized') }}"
@@ -615,21 +644,21 @@ permutations
 ^^^^^^^^^^^^
 To get permutations of a list::
 
-    - name: give me largest permutations (order matters)
-      debug:
-        msg: "{{ [1,2,3,4,5] | permutations | list }}"
+    - name: Give me largest permutations (order matters)
+      ansible.builtin.debug:
+        msg: "{{ [1,2,3,4,5] | ansible.builtin.permutations | list }}"
 
-    - name: give me permutations of sets of three
-      debug:
-        msg: "{{ [1,2,3,4,5] | permutations(3) | list }}"
+    - name: Give me permutations of sets of three
+      ansible.builtin.debug:
+        msg: "{{ [1,2,3,4,5] | ansible.builtin.permutations(3) | list }}"
 
 combinations
 ^^^^^^^^^^^^
 Combinations always require a set size::
 
-    - name: give me combinations for sets of two
-      debug:
-        msg: "{{ [1,2,3,4,5] | combinations(2) | list }}"
+    - name: Give me combinations for sets of two
+      ansible.builtin.debug:
+        msg: "{{ [1,2,3,4,5] | ansible.builtin.combinations(2) | list }}"
 
 Also see the :ref:`zip_filter`
 
@@ -639,8 +668,8 @@ The product filter returns the `cartesian product <https://docs.python.org/3/lib
 
 For example::
 
-  - name: generate multiple hostnames
-    debug:
+  - name: Generate multiple hostnames
+    ansible.builtin.debug:
       msg: "{{ ['foo', 'bar'] | product(['com']) | map('join', '.') | join(',') }}"
 
 This would result in::
@@ -659,7 +688,7 @@ To select a single element or a data subset from a complex data structure in JSO
 	This filter has migrated to the `community.general <https://galaxy.ansible.com/community/general>`_ collection. Follow the installation instructions to install that collection.
 
 
-.. note:: This filter is built upon **jmespath**, and you can use the same syntax. For examples, see `jmespath examples <http://jmespath.org/examples.html>`_.
+.. note:: You must manually install the **jmespath** dependency on the Ansible controller before using this filter. This filter is built upon **jmespath**, and you can use the same syntax. For examples, see `jmespath examples <http://jmespath.org/examples.html>`_.
 
 Consider this data structure::
 
@@ -712,22 +741,22 @@ Consider this data structure::
 
 To extract all clusters from this structure, you can use the following query::
 
-    - name: "Display all cluster names"
-      debug:
+    - name: Display all cluster names
+      ansible.builtin.debug:
         var: item
       loop: "{{ domain_definition | community.general.json_query('domain.cluster[*].name') }}"
 
 To extract all server names::
 
-    - name: "Display all server names"
-      debug:
+    - name: Display all server names
+      ansible.builtin.debug:
         var: item
       loop: "{{ domain_definition | community.general.json_query('domain.server[*].name') }}"
 
 To extract ports from cluster1::
 
-    - name: "Display all ports from cluster1"
-      debug:
+    - name: Display all ports from cluster1
+      ansible.builtin.debug:
         var: item
       loop: "{{ domain_definition | community.general.json_query(server_name_cluster1_query) }}"
       vars:
@@ -737,16 +766,16 @@ To extract ports from cluster1::
 
 To print out the ports from cluster1 in a comma separated string::
 
-    - name: "Display all ports from cluster1 as a string"
-      debug:
+    - name: Display all ports from cluster1 as a string
+      ansible.builtin.debug:
         msg: "{{ domain_definition | community.general.json_query('domain.server[?cluster==`cluster1`].port') | join(', ') }}"
 
 .. note:: In the example above, quoting literals using backticks avoids escaping quotes and maintains readability.
 
 You can use YAML `single quote escaping <https://yaml.org/spec/current.html#id2534365>`_::
 
-    - name: "Display all ports from cluster1"
-      debug:
+    - name: Display all ports from cluster1
+      ansible.builtin.debug:
         var: item
       loop: "{{ domain_definition | community.general.json_query('domain.server[?cluster==''cluster1''].port') }}"
 
@@ -754,12 +783,30 @@ You can use YAML `single quote escaping <https://yaml.org/spec/current.html#id25
 
 To get a hash map with all ports and names of a cluster::
 
-    - name: "Display all server ports and names from cluster1"
-      debug:
+    - name: Display all server ports and names from cluster1
+      ansible.builtin.debug:
         var: item
       loop: "{{ domain_definition | community.general.json_query(server_name_cluster1_query) }}"
       vars:
         server_name_cluster1_query: "domain.server[?cluster=='cluster2'].{name: name, port: port}"
+
+To extract ports from all clusters with name starting with 'server1'::
+
+    - name: Display all ports from cluster1
+      ansible.builtin.debug:
+        msg: "{{ domain_definition | to_json | from_json | community.general.json_query(server_name_query) }}"
+      vars:
+        server_name_query: "domain.server[?starts_with(name,'server1')].port"
+
+To extract ports from all clusters with name containing 'server1'::
+
+    - name: Display all ports from cluster1
+      ansible.builtin.debug:
+        msg: "{{ domain_definition | to_json | from_json | community.general.json_query(server_name_query) }}"
+      vars:
+        server_name_query: "domain.server[?contains(name,'server1')].port"
+
+.. note:: while using ``starts_with`` and ``contains``, you have to use `` to_json | from_json `` filter for correct parsing of data structure.
 
 
 Randomizing data
@@ -807,7 +854,7 @@ To get a random item from a list::
     "{{ ['a','b','c'] | random }}"
     # => 'c'
 
-To get a random number between 0 and a specified number::
+To get a random number between 0 (inclusive) and a specified integer (exclusive)::
 
     "{{ 60 | random }} * * * * root /script/from/cron"
     # => '21 * * * * root /script/from/cron'
@@ -859,19 +906,33 @@ To get the minimum value from list of numbers::
 
     {{ list1 | min }}
 
+.. versionadded:: 2.11
+
+To get the minimum value in a list of objects::
+
+    {{ [{'val': 1}, {'val': 2}] | min(attribute='val') }}
+
 To get the maximum value from a list of numbers::
 
     {{ [3, 4, 2] | max }}
+
+.. versionadded:: 2.11
+
+To get the maximum value in a list of objects::
+
+    {{ [{'val': 1}, {'val': 2}] | max(attribute='val') }}
 
 .. versionadded:: 2.5
 
 Flatten a list (same thing the `flatten` lookup does)::
 
     {{ [3, [4, 2] ] | flatten }}
+    # => [3, 4, 2]
 
 Flatten only the first level of a list (akin to the `items` lookup)::
 
     {{ [3, [4, [2]] ] | flatten(levels=1) }}
+    # => [3, 4, [2]]
 
 
 .. versionadded:: 2.11
@@ -879,7 +940,7 @@ Flatten only the first level of a list (akin to the `items` lookup)::
 Preserve nulls in a list, by default flatten removes them. ::
 
     {{ [3, None, [4, [2]] ] | flatten(levels=1, skip_nulls=False) }}
-
+    # => [3, None, 4, [2]]
 
 
 .. _set_theory_filters:
@@ -893,24 +954,37 @@ You can select or combine items from sets or lists.
 
 To get a unique set from a list::
 
+    # list1: [1, 2, 5, 1, 3, 4, 10]
     {{ list1 | unique }}
+    # => [1, 2, 5, 3, 4, 10]
 
 To get a union of two lists::
 
+    # list1: [1, 2, 5, 1, 3, 4, 10]
+    # list2: [1, 2, 3, 4, 5, 11, 99]
     {{ list1 | union(list2) }}
+    # => [1, 2, 5, 1, 3, 4, 10, 11, 99]
 
 To get the intersection of 2 lists (unique list of all items in both)::
 
+    # list1: [1, 2, 5, 3, 4, 10]
+    # list2: [1, 2, 3, 4, 5, 11, 99]
     {{ list1 | intersect(list2) }}
+    # => [1, 2, 5, 3, 4]
 
 To get the difference of 2 lists (items in 1 that don't exist in 2)::
 
+    # list1: [1, 2, 5, 1, 3, 4, 10]
+    # list2: [1, 2, 3, 4, 5, 11, 99]
     {{ list1 | difference(list2) }}
+    # => [10]
 
 To get the symmetric difference of 2 lists (items exclusive to each list)::
 
+    # list1: [1, 2, 5, 1, 3, 4, 10]
+    # list2: [1, 2, 3, 4, 5, 11, 99]
     {{ list1 | symmetric_difference(list2) }}
-
+    # => [10, 11, 99]
 
 .. _math_stuff:
 
@@ -923,21 +997,26 @@ You can calculate logs, powers, and roots of numbers with Ansible filters. Jinja
 
 Get the logarithm (default is e)::
 
-    {{ myvar | log }}
+    {{ 8 | log }}
+    # => 2.0794415416798357
 
 Get the base 10 logarithm::
 
-    {{ myvar | log(10) }}
+    {{ 8 | log(10) }}
+    # => 0.9030899869919435
 
 Give me the power of 2! (or 5)::
 
-    {{ myvar | pow(2) }}
-    {{ myvar | pow(5) }}
+    {{ 8 | pow(5) }}
+    # => 32768.0
 
 Square root, or the 5th::
 
-    {{ myvar | root }}
-    {{ myvar | root(5) }}
+    {{ 8 | root }}
+    # => 2.8284271247461903
+
+    {{ 8 | root(5) }}
+    # => 1.5157165665103982
 
 
 Managing network interactions
@@ -969,6 +1048,7 @@ IP address filter can also be used to extract specific information from an IP
 address. For example, to get the IP address itself from a CIDR, you can use::
 
   {{ '192.0.2.1/24' | ansible.netcommon.ipaddr('address') }}
+  # => 192.168.0.1
 
 More information about ``ipaddr`` filter and complete usage guide can be found
 in :ref:`playbooks_filters_ipaddr`.
@@ -1200,6 +1280,7 @@ Another example Jinja template::
     switchport trunk allowed vlan {{ parsed_vlans[0] }}
     {% for i in range (1, parsed_vlans | count) %}
     switchport trunk allowed vlan add {{ parsed_vlans[i] }}
+    {% endfor %}
 
 This allows for dynamic generation of VLAN lists on a Cisco IOS tagged interface. You can store an exhaustive raw list of the exact VLANs required for an interface and then compare that to the parsed IOS output that would actually be generated for the configuration.
 
@@ -1214,14 +1295,17 @@ Encrypting and checksumming strings and passwords
 To get the sha1 hash of a string::
 
     {{ 'test1' | hash('sha1') }}
+    # => "b444ac06613fc8d63795be9ad0beaf55011936ac"
 
 To get the md5 hash of a string::
 
     {{ 'test1' | hash('md5') }}
+    # => "5a105e8b9d40e1329780d62ea2265d8a"
 
 Get a string checksum::
 
     {{ 'test2' | checksum }}
+    # => "109f4b3c50d7b0df729d299bc6f8e9ef9066971f"
 
 Other hashes (platform dependent)::
 
@@ -1230,22 +1314,26 @@ Other hashes (platform dependent)::
 To get a sha512 password hash (random salt)::
 
     {{ 'passwordsaresecret' | password_hash('sha512') }}
+    # => "$6$UIv3676O/ilZzWEE$ktEfFF19NQPF2zyxqxGkAceTnbEgpEKuGBtk6MlU4v2ZorWaVQUMyurgmHCh2Fr4wpmQ/Y.AlXMJkRnIS4RfH/"
 
 To get a sha256 password hash with a specific salt::
 
     {{ 'secretpassword' | password_hash('sha256', 'mysecretsalt') }}
+    # => "$5$mysecretsalt$ReKNyDYjkKNqRVwouShhsEqZ3VOE8eoVO4exihOfvG4"
 
 An idempotent method to generate unique hashes per system is to use a salt that is consistent between runs::
 
     {{ 'secretpassword' | password_hash('sha512', 65534 | random(seed=inventory_hostname) | string) }}
+    # => "$6$43927$lQxPKz2M2X.NWO.gK.t7phLwOKQMcSq72XxDZQ0XzYV6DlL1OD72h417aj16OnHTGxNzhftXJQBcjbunLEepM0"
 
-Hash types available depend on the master system running Ansible, 'hash' depends on hashlib, password_hash depends on passlib (https://passlib.readthedocs.io/en/stable/lib/passlib.hash.html).
+Hash types available depend on the control system running Ansible, 'hash' depends on hashlib, password_hash depends on passlib (https://passlib.readthedocs.io/en/stable/lib/passlib.hash.html).
 
 .. versionadded:: 2.7
 
 Some hash types allow providing a rounds parameter::
 
     {{ 'secretpassword' | password_hash('sha256', 'mysecretsalt', rounds=10000) }}
+    # => "$5$rounds=10000$mysecretsalt$Tkm80llAxD4YHll6AgNIztKn0vzAACsuuEfYeGP7tm7"
 
 .. _other_useful_filters:
 
@@ -1338,6 +1426,14 @@ which produces this output:
     # host: myhost
     #
 
+URLEncode Variables
+-------------------
+
+The ``urlencode`` filter quotes data for use in a URL path or query using UTF-8::
+
+    {{ 'Trollhättan' | urlencode }}
+    # => 'Trollh%C3%A4ttan'
+
 Splitting URLs
 --------------
 
@@ -1393,9 +1489,11 @@ To search a string with a regex, use the "regex_search" filter::
 
     # search for "foo" in "foobar"
     {{ 'foobar' | regex_search('(foo)') }}
+    # => "foo"
 
     # will return empty if it cannot find a match
     {{ 'ansible' | regex_search('(foobar)') }}
+    # => ""
 
     # case insensitive search in multiline mode
     {{ 'foo\nBAR' | regex_search("^bar", multiline=True, ignorecase=True) }}
@@ -1411,18 +1509,23 @@ To replace text in a string with regex, use the "regex_replace" filter::
 
     # convert "ansible" to "able"
     {{ 'ansible' | regex_replace('^a.*i(.*)$', 'a\\1') }}
+    # => 'able'
 
     # convert "foobar" to "bar"
     {{ 'foobar' | regex_replace('^f.*o(.*)$', '\\1') }}
+    # => 'bar'
 
     # convert "localhost:80" to "localhost, 80" using named groups
     {{ 'localhost:80' | regex_replace('^(?P<host>.+):(?P<port>\\d+)$', '\\g<host>, \\g<port>') }}
+    # => 'localhost, 80'
 
     # convert "localhost:80" to "localhost"
     {{ 'localhost:80' | regex_replace(':80') }}
+    # => 'localhost'
 
     # change a multiline string
-    {{ var | regex_replace('^', '#CommentThis#', multiline=True) }}
+    {{ 'var' | regex_replace('^', '#CommentThis#', multiline=True) }}
+    # => '#CommentThis#var'
 
 .. note::
    If you want to match the whole string and you are using ``*`` make sure to always wraparound your regular expression with the start/end anchors. For example ``^(.*)$`` will always match only one result, while ``(.*)`` on some Python versions will match the whole string and an empty string at the end, which means it will make two replacements::
@@ -1446,7 +1549,7 @@ To replace text in a string with regex, use the "regex_replace" filter::
       {{ hosts | map('regex_replace', '(.*)', '\\1:80') | list }}
 
 .. note::
-   Prior to ansible 2.0, if "regex_replace" filter was used with variables inside YAML arguments (as opposed to simpler 'key=value' arguments), then you needed to escape backreferences (e.g. ``\\1``) with 4 backslashes (``\\\\``) instead of 2 (``\\``).
+   Prior to ansible 2.0, if "regex_replace" filter was used with variables inside YAML arguments (as opposed to simpler 'key=value' arguments), then you needed to escape backreferences (for example, ``\\1``) with 4 backslashes (``\\\\``) instead of 2 (``\\``).
 
 .. versionadded:: 2.0
 
@@ -1519,6 +1622,14 @@ To get the root and extension of a path or file name (new in version 2.0)::
     # with path == 'nginx.conf' the return would be ('nginx', '.conf')
     {{ path | splitext }}
 
+The ``splitext`` filter returns a string. The individual components can be accessed by using the ``first`` and ``last`` filters::
+
+    # with path == 'nginx.conf' the return would be 'nginx'
+    {{ path | splitext | first }}
+
+    # with path == 'nginx.conf' the return would be 'conf'
+    {{ path | splitext | last }}
+
 To join one or more path components::
 
     {{ ('/etc', path, 'subdir', file) | path_join }}
@@ -1530,11 +1641,18 @@ Manipulating strings
 
 To add quotes for shell usage::
 
-    - shell: echo {{ string_value | quote }}
+    - name: Run a shell command
+      ansible.builtin.shell: echo {{ string_value | quote }}
 
 To concatenate a list into a string::
 
     {{ list | join(" ") }}
+
+To split a sting into a list::
+
+.. versionadded:: 2.11
+
+    {{ csv_string | split(",") }}
 
 To work with Base64 encoded strings::
 
@@ -1567,7 +1685,7 @@ To create a namespaced UUIDv5 using the default Ansible namespace '361E6D51-FAEC
 
 To make use of one attribute from each item in a list of complex variables, use the :func:`Jinja2 map filter <jinja2:map>`::
 
-    # get a comma-separated list of the mount points (e.g. "/,/mnt/stuff") on a host
+    # get a comma-separated list of the mount points (for example, "/,/mnt/stuff") on a host
     {{ ansible_mounts | map(attribute='mount') | join(',') }}
 
 Handling dates and times
@@ -1578,12 +1696,14 @@ To get a date object from a string use the `to_datetime` filter::
     # Get total amount of seconds between two dates. Default date format is %Y-%m-%d %H:%M:%S but you can pass your own format
     {{ (("2016-08-14 20:00:12" | to_datetime) - ("2015-12-25" | to_datetime('%Y-%m-%d'))).total_seconds()  }}
 
-    # Get remaining seconds after delta has been calculated. NOTE: This does NOT convert years, days, hours, etc to seconds. For that, use total_seconds()
+    # Get remaining seconds after delta has been calculated. NOTE: This does NOT convert years, days, hours, and so on to seconds. For that, use total_seconds()
     {{ (("2016-08-14 20:00:12" | to_datetime) - ("2016-08-14 18:00:00" | to_datetime)).seconds  }}
     # This expression evaluates to "12" and not "132". Delta is 2 hours, 12 seconds
 
     # get amount of days between two dates. This returns only number of days and discards remaining hours, minutes, and seconds
     {{ (("2016-08-14 20:00:12" | to_datetime) - ("2015-12-25" | to_datetime('%Y-%m-%d'))).days  }}
+
+.. note:: For a full list of format codes for working with python date format strings, see https://docs.python.org/3/library/datetime.html#strftime-and-strptime-behavior.
 
 .. versionadded:: 2.4
 
@@ -1591,12 +1711,15 @@ To format a date using a string (like with the shell date command), use the "str
 
     # Display year-month-day
     {{ '%Y-%m-%d' | strftime }}
+    # => "2021-03-19"
 
     # Display hour:min:sec
     {{ '%H:%M:%S' | strftime }}
+    # => "21:51:04"
 
     # Use ansible_date_time.epoch fact
     {{ '%Y-%m-%d %H:%M:%S' | strftime(ansible_date_time.epoch) }}
+    # => "2021-03-19 21:54:09"
 
     # Use arbitrary epoch value
     {{ '%Y-%m-%d' | strftime(0) }}          # => 1970-01-01
@@ -1620,7 +1743,8 @@ This can then be used to reference hashes in Pod specifications::
 
     my_secret:
       kind: Secret
-      name: my_secret_name
+      metadata:
+        name: my_secret_name
 
     deployment_resource:
       kind: Deployment
@@ -1652,7 +1776,7 @@ This can then be used to reference hashes in Pod specifications::
    :ref:`playbooks_reuse_roles`
        Playbook organization by roles
    :ref:`playbooks_best_practices`
-       Best practices in playbooks
+       Tips and tricks for playbooks
    `User Mailing List <https://groups.google.com/group/ansible-devel>`_
        Have a question?  Stop by the google group!
    `irc.freenode.net <http://irc.freenode.net>`_

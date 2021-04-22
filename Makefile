@@ -5,16 +5,20 @@
 # useful targets:
 #   make clean ---------------- clean up
 #   make webdocs -------------- produce ansible doc at docs/docsite/_build/html
+#   make coredocs ------------- produce core doc at docs/docsite/_build/html
 #   make sdist ---------------- produce a tarball
 #   make deb-src -------------- produce a DEB source
 #   make deb ------------------ produce a DEB
 #   make docs ----------------- rebuild the manpages (results are checked in)
+#   make gettext -------------- produce POT files for docs
+#   make generate-po ---------- generate language specfic po file
+#   make needs-translation ---- generate list of file with unstranlated or fuzzy string for a specific language
 #   make tests ---------------- run the tests (see https://docs.ansible.com/ansible/devel/dev_guide/testing_units.html for requirements)
 
 ########################################################
 # variable section
 
-NAME = ansible-base
+NAME = ansible-core
 OS = $(shell uname -s)
 PREFIX ?= '/usr/local'
 SDIST_DIR ?= 'dist'
@@ -56,6 +60,9 @@ else
 DATE := $(shell date --utc --date="$(GIT_DATE)" +%Y%m%d%H%M)
 CPUS ?= $(shell nproc)
 endif
+
+# Intenationalisation and Localisation
+LANGUAGES ?=
 
 # DEB build parameters
 DEBUILD_BIN ?= debuild
@@ -270,6 +277,22 @@ epub:
 webdocs:
 	(cd docs/docsite/; CPUS=$(CPUS) $(MAKE) docs)
 
+.PHONY: coredocs
+coredocs:
+	(cd docs/docsite/; CPUS=$(CPUS) $(MAKE) coredocs)
+
+.PHONY: gettext
+gettext:
+	(cd docs/docsite/; CPUS=$(CPUS) $(MAKE) gettext)
+
+.PHONY: generate-po
+generate-po:
+	(cd docs/docsite/; CPUS=$(CPUS) LANGUAGES=$(LANGUAGES) $(MAKE) generate-po)
+
+.PHONY: needs-translation
+needs-translation:
+	(cd docs/docsite/; CPUS=$(CPUS) LANGUAGES=$(LANGUAGES) $(MAKE) needs-translation)
+
 .PHONY: linkcheckdocs
 linkcheckdocs:
 	(cd docs/docsite/; CPUS=$(CPUS) $(MAKE) linkcheckdocs)
@@ -277,7 +300,7 @@ linkcheckdocs:
 .PHONY: generate_rst
 generate_rst: lib/ansible/cli/*.py
 	mkdir -p ./docs/man/man1/ ; \
-	PYTHONPATH=./lib $(GENERATE_CLI) --template-file=docs/templates/man.j2 --output-dir=docs/man/man1/ --output-format man lib/ansible/cli/*.py
+	$(GENERATE_CLI) --template-file=docs/templates/man.j2 --output-dir=docs/man/man1/ --output-format man lib/ansible/cli/*.py
 
 
 docs: generate_rst

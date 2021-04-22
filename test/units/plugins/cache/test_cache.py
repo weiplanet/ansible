@@ -21,19 +21,21 @@ __metaclass__ = type
 
 from units.compat import unittest, mock
 from ansible.errors import AnsibleError
-from ansible.plugins.cache import FactCache, CachePluginAdjudicator
+from ansible.plugins.cache import CachePluginAdjudicator
 from ansible.plugins.cache.base import BaseCacheModule
 from ansible.plugins.cache.memory import CacheModule as MemoryCache
 from ansible.plugins.loader import cache_loader
+from ansible.vars.fact_cache import FactCache
 
 import pytest
 
 
-class TestCachePluginAdjudicator:
-    # memory plugin cache
-    cache = CachePluginAdjudicator()
-    cache['cache_key'] = {'key1': 'value1', 'key2': 'value2'}
-    cache['cache_key_2'] = {'key': 'value'}
+class TestCachePluginAdjudicator(unittest.TestCase):
+    def setUp(self):
+        # memory plugin cache
+        self.cache = CachePluginAdjudicator()
+        self.cache['cache_key'] = {'key1': 'value1', 'key2': 'value2'}
+        self.cache['cache_key_2'] = {'key': 'value'}
 
     def test___setitem__(self):
         self.cache['new_cache_key'] = {'new_key1': ['new_value1', 'new_value2']}
@@ -77,6 +79,23 @@ class TestCachePluginAdjudicator:
         self.cache.update({'cache_key': {'key2': 'updatedvalue'}})
         assert self.cache['cache_key']['key2'] == 'updatedvalue'
 
+    def test_flush(self):
+        # Fake that the cache already has some data in it but the adjudicator
+        # hasn't loaded it in.
+        self.cache._plugin.set('monkey', 'animal')
+        self.cache._plugin.set('wolf', 'animal')
+        self.cache._plugin.set('another wolf', 'another animal')
+
+        # The adjudicator does't know about the new entries
+        assert len(self.cache) == 2
+        # But the cache itself does
+        assert len(self.cache._plugin._cache) == 3
+
+        # If we call flush, both the adjudicator and the cache should flush
+        self.cache.flush()
+        assert len(self.cache) == 0
+        assert len(self.cache._plugin._cache) == 0
+
 
 class TestFactCache(unittest.TestCase):
 
@@ -102,16 +121,6 @@ class TestFactCache(unittest.TestCase):
     def test_update(self):
         self.cache.update({'cache_key': {'key2': 'updatedvalue'}})
         assert self.cache['cache_key']['key2'] == 'updatedvalue'
-
-    def test_update_legacy(self):
-        self.cache.update('cache_key', {'key2': 'updatedvalue'})
-        assert self.cache['cache_key']['key2'] == 'updatedvalue'
-
-    def test_update_legacy_key_exists(self):
-        self.cache['cache_key'] = {'key': 'value', 'key2': 'value2'}
-        self.cache.update('cache_key', {'key': 'updatedvalue'})
-        assert self.cache['cache_key']['key'] == 'updatedvalue'
-        assert self.cache['cache_key']['key2'] == 'value2'
 
 
 class TestAbstractClass(unittest.TestCase):

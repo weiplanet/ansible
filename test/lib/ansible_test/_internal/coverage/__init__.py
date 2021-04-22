@@ -2,6 +2,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import errno
 import os
 import re
 
@@ -61,6 +62,7 @@ class CoverageConfig(EnvironmentConfig):
         self.group_by = frozenset(args.group_by) if 'group_by' in args and args.group_by else set()  # type: t.FrozenSet[str]
         self.all = args.all if 'all' in args else False  # type: bool
         self.stub = args.stub if 'stub' in args else False  # type: bool
+        self.export = args.export if 'export' in args else None  # type: str
         self.coverage = False  # temporary work-around to support intercept_command in cover.py
 
 
@@ -104,7 +106,7 @@ def run_coverage(args, output_file, command, cmd):  # type: (CoverageConfig, str
     env = common_environment()
     env.update(dict(COVERAGE_FILE=output_file))
 
-    cmd = ['python', '-m', 'coverage', command, '--rcfile', COVERAGE_CONFIG_PATH] + cmd
+    cmd = ['python', '-m', 'coverage.__main__', command, '--rcfile', COVERAGE_CONFIG_PATH] + cmd
 
     intercept_command(args, target_name='coverage', env=env, cmd=cmd, disable_coverage=True)
 
@@ -122,8 +124,15 @@ def get_powershell_coverage_files(path=None):  # type: (t.Optional[str]) -> t.Li
 def get_coverage_files(language, path=None):  # type: (str, t.Optional[str]) -> t.List[str]
     """Return the list of coverage file paths for the given language."""
     coverage_dir = path or ResultType.COVERAGE.path
-    coverage_files = [os.path.join(coverage_dir, f) for f in os.listdir(coverage_dir)
-                      if '=coverage.' in f and '=%s' % language in f]
+
+    try:
+        coverage_files = [os.path.join(coverage_dir, f) for f in os.listdir(coverage_dir)
+                          if '=coverage.' in f and '=%s' % language in f]
+    except IOError as ex:
+        if ex.errno == errno.ENOENT:
+            return []
+
+        raise
 
     return coverage_files
 
@@ -162,8 +171,8 @@ def enumerate_python_arcs(
     try:
         original.read_file(path)
     except Exception as ex:  # pylint: disable=locally-disabled, broad-except
-        with open_binary_file(path) as file:
-            header = file.read(6)
+        with open_binary_file(path) as file_obj:
+            header = file_obj.read(6)
 
         if header == b'SQLite':
             display.error('File created by "coverage" 5.0+: %s' % os.path.relpath(path))
@@ -208,6 +217,14 @@ def enumerate_powershell_lines(
         filename = sanitize_filename(filename, collection_search_re=collection_search_re, collection_sub_re=collection_sub_re)
 
         if not filename:
+            continue
+
+        if isinstance(hits, dict) and not hits.get('Line'):
+            # Input data was previously aggregated and thus uses the standard ansible-test output format for PowerShell coverage.
+            # This format differs from the more verbose format of raw coverage data from the remote Windows hosts.
+            hits = dict((int(key), value) for key, value in hits.items())
+
+            yield filename, hits
             continue
 
         # PowerShell unpacks arrays if there's only a single entry so this is a defensive check on that
@@ -278,6 +295,8 @@ def sanitize_filename(
         new_name = re.sub(r'^.*' + re.escape(integration_temp_path) + '[^/]+/', root_path, filename)
         display.info('%s -> %s' % (filename, new_name), verbosity=3)
         filename = new_name
+
+    filename = os.path.abspath(filename)  # make sure path is absolute (will be relative if previously exported)
 
     return filename
 

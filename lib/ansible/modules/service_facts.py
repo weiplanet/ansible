@@ -14,9 +14,9 @@ DOCUMENTATION = r'''
 module: service_facts
 short_description: Return service state information as fact data
 description:
-     - Return service state information as fact data for various service management utilities
+     - Return service state information as fact data for various service management utilities.
 version_added: "2.5"
-requirements: ["Any of the following supported init systems: systemd, sysv, upstart"]
+requirements: ["Any of the following supported init systems: systemd, sysv, upstart, AIX SRC"]
 
 notes:
   - When accessing the C(ansible_facts.services) facts collected by this module,
@@ -25,6 +25,8 @@ notes:
     C(ansible_facts.services.zuul-gateway). It is instead recommended to
     using the string value of the service name as the key in order to obtain
     the fact data value like C(ansible_facts.services['zuul-gateway'])
+  - AIX SRC was added in version 2.11.
+  - Supports C(check_mode).
 
 author:
   - Adam Miller (@maxamillion)
@@ -32,11 +34,11 @@ author:
 
 EXAMPLES = r'''
 - name: Populate service facts
-  service_facts:
+  ansible.builtin.service_facts:
 
-- debug:
+- name: Print service facts
+  ansible.builtin.debug:
     var: ansible_facts.services
-
 '''
 
 RETURN = r'''
@@ -53,14 +55,14 @@ ansible_facts:
         source:
           description:
           - Init system of the service.
-          - One of C(systemd), C(sysv), C(upstart).
+          - One of C(rcctl), C(systemd), C(sysv), C(upstart), C(src).
           returned: always
           type: str
           sample: sysv
         state:
           description:
           - State of the service.
-          - Either C(running), C(stopped), or C(unknown).
+          - Either C(failed), C(running), C(stopped), or C(unknown).
           returned: always
           type: str
           sample: running
@@ -68,7 +70,7 @@ ansible_facts:
           description:
           - State of the service.
           - Either C(enabled), C(disabled), C(static), C(indirect) or C(unknown).
-          returned: systemd systems or RedHat/SUSE flavored sysvinit/upstart
+          returned: systemd systems or RedHat/SUSE flavored sysvinit/upstart or OpenBSD
           type: str
           sample: enabled
         name:
@@ -79,6 +81,7 @@ ansible_facts:
 '''
 
 
+import platform
 import re
 from ansible.module_utils.basic import AnsibleModule
 
@@ -230,10 +233,82 @@ class SystemctlScanService(BaseService):
         return services
 
 
+class AIXScanService(BaseService):
+
+    def gather_services(self):
+        services = {}
+        if platform.system() != 'AIX':
+            return None
+        lssrc_path = self.module.get_bin_path("lssrc")
+        if lssrc_path is None:
+            return None
+        rc, stdout, stderr = self.module.run_command("%s -a" % lssrc_path)
+        for line in stdout.split('\n'):
+            line_data = line.split()
+            if len(line_data) < 2:
+                continue  # Skipping because we expected more data
+            if line_data[0] == "Subsystem":
+                continue  # Skip header
+            service_name = line_data[0]
+            if line_data[-1] == "active":
+                service_state = "running"
+            elif line_data[-1] == "inoperative":
+                service_state = "stopped"
+            else:
+                service_state = "unknown"
+            services[service_name] = {"name": service_name, "state": service_state, "source": "src"}
+        return services
+
+
+class OpenBSDScanService(BaseService):
+    def query_rcctl(self, cmd):
+        svcs = []
+
+        rc, stdout, stderr = self.module.run_command("%s ls %s" % (self.rcctl_path, cmd))
+        if 'needs root privileges' in stderr.lower():
+            self.incomplete_warning = True
+            return []
+
+        for svc in stdout.split('\n'):
+            if svc == '':
+                continue
+            else:
+                svcs.append(svc)
+
+        return svcs
+
+    def gather_services(self):
+        services = {}
+        self.rcctl_path = self.module.get_bin_path("rcctl")
+        if self.rcctl_path is None:
+            return None
+
+        for svc in self.query_rcctl('all'):
+            services[svc] = {'name': svc, 'source': 'rcctl'}
+
+        for svc in self.query_rcctl('on'):
+            services[svc].update({'status': 'enabled'})
+
+        for svc in self.query_rcctl('started'):
+            services[svc].update({'state': 'running'})
+
+        # Based on the list of services that are enabled, determine which are disabled
+        [services[svc].update({'status': 'disabled'}) for svc in services if services[svc].get('status') is None]
+
+        # and do the same for those are aren't running
+        [services[svc].update({'state': 'stopped'}) for svc in services if services[svc].get('state') is None]
+
+        # Override the state for services which are marked as 'failed'
+        for svc in self.query_rcctl('failed'):
+            services[svc].update({'state': 'failed'})
+
+        return services
+
+
 def main():
     module = AnsibleModule(argument_spec=dict(), supports_check_mode=True)
     module.run_command_environ_update = dict(LANG="C", LC_ALL="C")
-    service_modules = (ServiceScanService, SystemctlScanService)
+    service_modules = (ServiceScanService, SystemctlScanService, AIXScanService, OpenBSDScanService)
     all_services = {}
     incomplete_warning = False
     for svc_module in service_modules:

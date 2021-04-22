@@ -18,7 +18,7 @@ version_added: historical
 short_description: Manages packages with the I(yum) package manager
 description:
      - Installs, upgrade, downgrades, removes, and lists packages and groups with the I(yum) package manager.
-     - This module only works on Python 2. If you require Python 3 support see the M(dnf) module.
+     - This module only works on Python 2. If you require Python 3 support see the M(ansible.builtin.dnf) module.
 options:
   use_backend:
     description:
@@ -28,10 +28,12 @@ options:
       - By default, this module will select the backend based on the C(ansible_pkg_mgr) fact.
     default: "auto"
     choices: [ auto, yum, yum4, dnf ]
+    type: str
     version_added: "2.7"
   name:
     description:
       - A package name or package specifier with version, like C(name-1.0).
+      - Comparison operators for package version are valid here C(>), C(<), C(>=), C(<=). Example - C(name>=1.0)
       - If a previous version is specified, the task also needs to turn C(allow_downgrade) on.
         See the C(allow_downgrade) documentation for caveats with downgrading packages.
       - When using state=latest, this can be C('*') which means run C(yum -y update).
@@ -43,12 +45,15 @@ options:
   exclude:
     description:
       - Package name(s) to exclude when state=present, or latest
+    type: list
+    elements: str
     version_added: "2.0"
   list:
     description:
       - "Package name to run the equivalent of yum list --show-duplicates <package> against. In addition to listing packages,
         use can also list the following: C(installed), C(updates), C(available) and C(repos)."
       - This parameter is mutually exclusive with C(name).
+    type: str
   state:
     description:
       - Whether to install (C(present) or C(installed), C(latest)), or remove (C(absent) or C(removed)) a package.
@@ -57,6 +62,7 @@ options:
       - C(absent) and C(removed) will remove the specified package.
       - Default is C(None), however in effect the default action is C(present) unless the C(autoremove) option is
         enabled for this module, then C(absent) is inferred.
+    type: str
     choices: [ absent, installed, latest, present, removed ]
   enablerepo:
     description:
@@ -65,6 +71,8 @@ options:
         When specifying multiple repos, separate them with a C(",").
       - As of Ansible 2.7, this can alternatively be a list instead of C(",")
         separated string
+    type: list
+    elements: str
     version_added: "0.9"
   disablerepo:
     description:
@@ -73,10 +81,13 @@ options:
         When specifying multiple repos, separate them with a C(",").
       - As of Ansible 2.7, this can alternatively be a list instead of C(",")
         separated string
+    type: list
+    elements: str
     version_added: "0.9"
   conf_file:
     description:
       - The remote yum configuration file to use for the transaction.
+    type: str
     version_added: "0.6"
   disable_gpg_check:
     description:
@@ -121,6 +132,7 @@ options:
       - Specifies an alternative installroot, relative to which all packages
         will be installed.
     default: "/"
+    type: str
     version_added: "2.3"
   security:
     description:
@@ -132,6 +144,7 @@ options:
     description:
       - If set to C(yes), and C(state=latest) then only installs updates that have been marked bugfix related.
     default: "no"
+    type: bool
     version_added: "2.6"
   allow_downgrade:
     description:
@@ -150,16 +163,21 @@ options:
     description:
       - I(Plugin) name to enable for the install/update operation.
         The enabled plugin will not persist beyond the transaction.
+    type: list
+    elements: str
     version_added: "2.5"
   disable_plugin:
     description:
       - I(Plugin) name to disable for the install/update operation.
         The disabled plugins will not persist beyond the transaction.
+    type: list
+    elements: str
     version_added: "2.5"
   releasever:
     description:
       - Specifies an alternative release from which all packages will be
         installed.
+    type: str
     version_added: "2.7"
   autoremove:
     description:
@@ -176,6 +194,7 @@ options:
       - If set to C(all), disables all excludes.
       - If set to C(main), disable excludes defined in [main] in yum.conf.
       - If set to C(repoid), disable excludes defined for given repo id.
+    type: str
     version_added: "2.7"
   download_only:
     description:
@@ -217,6 +236,12 @@ options:
     version_added: "1.5"
     default: "yes"
     type: bool
+  cacheonly:
+    description:
+      - Tells yum to run entirely from system cache; does not download or update metadata.
+    default: "no"
+    type: bool
+    version_added: "2.12"
 notes:
   - When used with a `loop:` each package will be processed individually,
     it is much more efficient to pass the list directly to the `name` option.
@@ -258,6 +283,11 @@ EXAMPLES = '''
   yum:
     name: httpd
     state: latest
+
+- name: Install Apache >= 2.4
+  yum:
+    name: httpd>=2.4
+    state: present
 
 - name: Install a list of packages (suitable replacement for 2.11 loop deprecation warning)
   yum:
@@ -346,6 +376,7 @@ EXAMPLES = '''
 '''
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.common.respawn import has_respawned, respawn_module
 from ansible.module_utils._text import to_native, to_text
 from ansible.module_utils.urls import fetch_url
 from ansible.module_utils.yumdnf import YumDnf, yumdnf_argument_spec
@@ -353,6 +384,7 @@ from ansible.module_utils.yumdnf import YumDnf, yumdnf_argument_spec
 import errno
 import os
 import re
+import sys
 import tempfile
 
 try:
@@ -1231,12 +1263,20 @@ class YumModule(YumDnf):
 
             pkg, version, repo = line[0], line[1], line[2]
             name, dist = pkg.rsplit('.', 1)
-            updates.update({name: {'version': version, 'dist': dist, 'repo': repo}})
+
+            if name not in updates:
+                updates[name] = []
+
+            updates[name].append({'version': version, 'dist': dist, 'repo': repo})
 
             if len(line) == 6:
                 obsolete_pkg, obsolete_version, obsolete_repo = line[3], line[4], line[5]
                 obsolete_name, obsolete_dist = obsolete_pkg.rsplit('.', 1)
-                obsoletes.update({obsolete_name: {'version': obsolete_version, 'dist': obsolete_dist, 'repo': obsolete_repo}})
+
+                if obsolete_name not in obsoletes:
+                    obsoletes[obsolete_name] = []
+
+                obsoletes[obsolete_name].append({'version': obsolete_version, 'dist': obsolete_dist, 'repo': obsolete_repo})
 
         return updates, obsoletes
 
@@ -1377,22 +1417,64 @@ class YumModule(YumDnf):
         to_update = []
         for w in will_update:
             if w.startswith('@'):
+                # yum groups
                 to_update.append((w, None))
             elif w not in updates:
+                # There are (at least, probably more) 2 ways we can get here:
+                #
+                # * A virtual provides (our user specifies "webserver", but
+                #   "httpd" is the key in 'updates').
+                #
+                # * A wildcard. emac* will get us here if there's a package
+                #   called 'emacs' in the pending updates list. 'updates' will
+                #   of course key on 'emacs' in that case.
+
                 other_pkg = will_update_from_other_package[w]
+
+                # We are guaranteed that: other_pkg in updates
+                # ...based on the logic above. But we only want to show one
+                # update in this case (given the wording of "at least") below.
+                # As an example, consider a package installed twice:
+                # foobar.x86_64, foobar.i686
+                # We want to avoid having both:
+                #   ('foo*', 'because of (at least) foobar-1.x86_64 from repo')
+                #   ('foo*', 'because of (at least) foobar-1.i686 from repo')
+                # We just pick the first one.
+                #
+                # TODO: This is something that might be nice to change, but it
+                #       would be a module UI change. But without it, we're
+                #       dropping potentially important information about what
+                #       was updated. Instead of (given_spec, random_matching_package)
+                #       it'd be nice if we appended (given_spec, [all_matching_packages])
+                #
+                #       ... But then, we also drop information if multiple
+                #       different (distinct) packages match the given spec and
+                #       we should probably fix that too.
+                pkg = updates[other_pkg][0]
                 to_update.append(
                     (
                         w,
                         'because of (at least) %s-%s.%s from %s' % (
                             other_pkg,
-                            updates[other_pkg]['version'],
-                            updates[other_pkg]['dist'],
-                            updates[other_pkg]['repo']
+                            pkg['version'],
+                            pkg['dist'],
+                            pkg['repo']
                         )
                     )
                 )
             else:
-                to_update.append((w, '%s.%s from %s' % (updates[w]['version'], updates[w]['dist'], updates[w]['repo'])))
+                # Otherwise the spec is an exact match
+                for pkg in updates[w]:
+                    to_update.append(
+                        (
+                            w,
+                            '%s.%s from %s' % (
+                                pkg['version'],
+                                pkg['dist'],
+                                pkg['repo']
+                            )
+                        )
+                    )
 
         if self.update_only:
             res['changes'] = dict(installed=[], updated=to_update)
@@ -1481,6 +1563,9 @@ class YumModule(YumDnf):
 
         if self.disable_excludes:
             self.yum_basecmd.extend(['--disableexcludes=%s' % self.disable_excludes])
+
+        if self.cacheonly:
+            self.yum_basecmd.extend(['--cacheonly'])
 
         if self.download_only:
             self.yum_basecmd.extend(['--downloadonly'])
@@ -1573,6 +1658,10 @@ class YumModule(YumDnf):
         """
         actually execute the module code backend
         """
+
+        if (not HAS_RPM_PYTHON or not HAS_YUM_PYTHON) and sys.executable != '/usr/bin/python' and not has_respawned():
+            respawn_module('/usr/bin/python')
+            # end of the line for this process; we'll exit here once the respawned module has completed
 
         error_msgs = []
         if not HAS_RPM_PYTHON:

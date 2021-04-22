@@ -12,6 +12,7 @@
   block:
 
   - include_tasks: ./setup.yml
+  - include_tasks: ./requirements.yml
   - include_tasks: ./individual_collection_repo.yml
   - include_tasks: ./setup_multi_collection_repo.yml
   - include_tasks: ./multi_collection_repo_all.yml
@@ -22,6 +23,7 @@
   - include_tasks: ./multi_collection_repo_individual.yml
   - include_tasks: ./setup_recursive_scm_dependency.yml
   - include_tasks: ./scm_dependency_deduplication.yml
+  - include_tasks: ./download.yml
 
   always:
 
@@ -38,3 +40,14 @@
       name: git
       state: absent
     when: git_install is changed
+
+  # This gets dragged in as a dependency of git on FreeBSD.
+  # We need to remove it too when done.
+  - name: remove python37 if necessary
+    package:
+      name: python37
+      state: absent
+    when:
+      - git_install is changed
+      - ansible_distribution == 'FreeBSD'
+      - ansible_python.version.major == 2

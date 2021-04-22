@@ -18,7 +18,7 @@ import time
 from abc import ABCMeta, abstractmethod
 
 from ansible import constants as C
-from ansible.errors import AnsibleError, AnsibleConnectionFailure, AnsibleActionSkip, AnsibleActionFail, AnsiblePluginRemovedError
+from ansible.errors import AnsibleError, AnsibleConnectionFailure, AnsibleActionSkip, AnsibleActionFail, AnsiblePluginRemovedError, AnsibleAuthenticationFailure
 from ansible.executor.module_common import modify_module
 from ansible.executor.interpreter_discovery import discover_interpreter, InterpreterDiscoveryRequiredError
 from ansible.module_utils.common._collections_compat import Sequence
@@ -89,6 +89,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         * Module parameters.  These are stored in self._task.args
         """
 
+        # does not default to {'changed': False, 'failed': False}, as it breaks async
         result = {}
 
         if tmp is not None:
@@ -163,6 +164,10 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         else:
             use_vars = task_vars
 
+        split_module_name = module_name.split('.')
+        collection_name = '.'.join(split_module_name[0:2]) if len(split_module_name) > 2 else ''
+        leaf_module_name = resource_from_fqcr(module_name)
+
         # Search module path(s) for named module.
         for mod_type in self._connection.module_implementation_preferences:
             # Check to determine if PowerShell modules are supported, and apply
@@ -171,17 +176,21 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 # FIXME: This should be temporary and moved to an exec subsystem plugin where we can define the mapping
                 # for each subsystem.
                 win_collection = 'ansible.windows'
-
+                rewrite_collection_names = ['ansible.builtin', 'ansible.legacy', '']
                 # async_status, win_stat, win_file, win_copy, and win_ping are not just like their
                 # python counterparts but they are compatible enough for our
                 # internal usage
-                if module_name in ('stat', 'file', 'copy', 'ping') and self._task.action != module_name:
-                    module_name = '%s.win_%s' % (win_collection, module_name)
-                elif module_name in ['async_status']:
-                    module_name = '%s.%s' % (win_collection, module_name)
+                # NB: we only rewrite the module if it's not being called by the user (eg, an action calling something else)
+                # and if it's unqualified or FQ to a builtin
+                if leaf_module_name in ('stat', 'file', 'copy', 'ping') and \
+                        collection_name in rewrite_collection_names and self._task.action != module_name:
+                    module_name = '%s.win_%s' % (win_collection, leaf_module_name)
+                elif leaf_module_name == 'async_status' and collection_name in rewrite_collection_names:
+                    module_name = '%s.%s' % (win_collection, leaf_module_name)
 
+                # TODO: move this tweak down to the modules, not extensible here
                 # Remove extra quotes surrounding path parameters before sending to module.
-                if resource_from_fqcr(module_name) in ['win_stat', 'win_file', 'win_copy', 'slurp'] and module_args and \
+                if leaf_module_name in ['win_stat', 'win_file', 'win_copy', 'slurp'] and module_args and \
                         hasattr(self._connection._shell, '_unquote'):
                     for key in ('src', 'dest', 'path'):
                         if key in module_args:
@@ -510,7 +519,9 @@ class ActionBase(with_metaclass(ABCMeta, object)):
           file with chown which only works in case the remote_user is
           privileged or the remote systems allows chown calls by unprivileged
           users (e.g. HP-UX)
-        * If the chown fails, we check if ansible_common_remote_group is set.
+        * If the above fails, we next try 'chmod +a' which is a macOS way of
+          setting ACLs on files.
+        * If the above fails, we check if ansible_common_remote_group is set.
           If it is, we attempt to chgrp the file to its value. This is useful
           if the remote_user has a group in common with the become_user. As the
           remote_user, we can chgrp the file to that group and allow the
@@ -532,103 +543,187 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         if remote_user is None:
             remote_user = self._get_remote_user()
 
+        # Step 1: Are we on windows?
         if getattr(self._connection._shell, "_IS_WINDOWS", False):
-            # This won't work on Powershell as-is, so we'll just completely skip until
-            # we have a need for it, at which point we'll have to do something different.
+            # This won't work on Powershell as-is, so we'll just completely
+            # skip until we have a need for it, at which point we'll have to do
+            # something different.
             return remote_paths
 
-        if self._is_become_unprivileged():
-            # Unprivileged user that's different than the ssh user.  Let's get
-            # to work!
-
-            become_user = self.get_become_option('become_user')
-
-            # Try to use file system acls to make the files readable for sudo'd
-            # user
+        # Step 2: If we're not becoming an unprivileged user, we are roughly
+        # done. Make the files +x if we're asked to, and return.
+        if not self._is_become_unprivileged():
             if execute:
-                chmod_mode = 'rx'
-                setfacl_mode = 'r-x'
-            else:
-                chmod_mode = 'rX'
-                # NOTE: this form fails silently on freebsd.  We currently
-                # never call _fixup_perms2() with execute=False but if we
-                # start to we'll have to fix this.
-                setfacl_mode = 'r-X'
-
-            res = self._remote_set_user_facl(remote_paths, become_user, setfacl_mode)
-            if res['rc'] != 0:
-                # File system acls failed; let's try to use chown next
-                # Set executable bit first as on some systems an
-                # unprivileged user can use chown
-                if execute:
-                    res = self._remote_chmod(remote_paths, 'u+x')
-                    if res['rc'] != 0:
-                        raise AnsibleError('Failed to set file mode on remote temporary files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
-
-                res = self._remote_chown(remote_paths, become_user)
+                # Can't depend on the file being transferred with execute permissions.
+                # Only need user perms because no become was used here
+                res = self._remote_chmod(remote_paths, 'u+x')
                 if res['rc'] != 0:
-                    # First check if we are an admin/root user. If we are
-                    # and failed here, something weird has happened.
-                    if remote_user in self._get_admin_users():
-                        # chown failed even if remote_user is administrator/root
-                        raise AnsibleError('Failed to change ownership of the temporary files Ansible needs to create despite connecting as a privileged user. '
-                                           'Unprivileged become user would be unable to read the file.')
+                    raise AnsibleError(
+                        'Failed to set execute bit on remote files '
+                        '(rc: {0}, err: {1})'.format(
+                            res['rc'],
+                            to_native(res['stderr'])))
+            return remote_paths
 
-                    # Otherwise, we're a normal user. We failed to chown the
-                    # paths to the unprivileged user, but if we have a common
-                    # group with them, we should be able to chown it to that.
-                    #
-                    # Note that we have no way of knowing if this will actually
-                    # work... just because chgrp exits successfully does not
-                    # mean that Ansible will work. We could check if the become
-                    # user is in the group, but this would create an extra
-                    # round trip.
-                    #
-                    # Also note that due to the above, this can prevent the
-                    # ALLOW_WORLD_READABLE_TMPFILES logic below from ever
-                    # getting called. We leave this up to the user to rectify
-                    # if they have both of these features enabled.
-                    group = self.get_shell_option('common_remote_group')
-                    if group is not None:
-                        res = self._remote_chgrp(remote_paths, group)
-                        if res['rc'] == 0:
-                            # If ALLOW_WORLD_READABLE_TMPFILES is set, we should warn the user
-                            # that something might go weirdly here.
-                            if C.ALLOW_WORLD_READABLE_TMPFILES:
-                                display.warning('Both common_remote_group and allow_world_readable_tmpfiles are set. chgrp was successful, but there is no '
-                                                'guarantee that Ansible will be able to read the files after this operation, particularly if '
-                                                'common_remote_group was set to a group of which the unprivileged become user is not a member. In this '
-                                                'situation, allow_world_readable_tmpfiles is a no-op. See the "Risks of becoming an unprivileged user" section '
-                                                'of the "Understanding privilege escalation: become" user guide documentation for more information')
-                            if execute:
-                                group_mode = 'g+rwx'
-                            else:
-                                group_mode = 'g+rw'
-                            res = self._remote_chmod(remote_paths, group_mode)
+        # If we're still here, we have an unprivileged user that's different
+        # than the ssh user.
+        become_user = self.get_become_option('become_user')
 
-                if res['rc'] != 0:
-                    if self.get_shell_option('world_readable_temp', C.ALLOW_WORLD_READABLE_TMPFILES):
-                        # chown and fs acls failed -- do things this insecure
-                        # way only if the user opted in in the config file
-                        display.warning('Using world-readable permissions for temporary files Ansible needs to create when becoming an unprivileged user. '
-                                        'This may be insecure. For information on securing this, see '
-                                        'https://docs.ansible.com/ansible/user_guide/become.html#risks-of-becoming-an-unprivileged-user')
-                        res = self._remote_chmod(remote_paths, 'a+%s' % chmod_mode)
-                        if res['rc'] != 0:
-                            raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
-                    else:
-                        raise AnsibleError('Failed to set permissions on the temporary files Ansible needs to create when becoming an unprivileged user '
-                                           '(rc: %s, err: %s}). For information on working around this, see '
-                                           'https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user'
-                                           % (res['rc'], to_native(res['stderr'])))
-        elif execute:
-            # Can't depend on the file being transferred with execute permissions.
-            # Only need user perms because no become was used here
+        # Try to use file system acls to make the files readable for sudo'd
+        # user
+        if execute:
+            chmod_mode = 'rx'
+            setfacl_mode = 'r-x'
+            # Apple patches their "file_cmds" chmod with ACL support
+            chmod_acl_mode = '{0} allow read,execute'.format(become_user)
+            # POSIX-draft ACL specification. Solaris, maybe others.
+            # See chmod(1) on something Solaris-based for syntax details.
+            posix_acl_mode = 'A+user:{0}:rx:allow'.format(become_user)
+        else:
+            chmod_mode = 'rX'
+            # TODO: this form fails silently on freebsd.  We currently
+            # never call _fixup_perms2() with execute=False but if we
+            # start to we'll have to fix this.
+            setfacl_mode = 'r-X'
+            # Apple
+            chmod_acl_mode = '{0} allow read'.format(become_user)
+            # POSIX-draft
+            posix_acl_mode = 'A+user:{0}:r:allow'.format(become_user)
+
+        # Step 3a: Are we able to use setfacl to add user ACLs to the file?
+        res = self._remote_set_user_facl(
+            remote_paths,
+            become_user,
+            setfacl_mode)
+
+        if res['rc'] == 0:
+            return remote_paths
+
+        # Step 3b: Set execute if we need to. We do this before anything else
+        # because some of the methods below might work but not let us set +x
+        # as part of them.
+        if execute:
             res = self._remote_chmod(remote_paths, 'u+x')
             if res['rc'] != 0:
-                raise AnsibleError('Failed to set execute bit on remote files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
+                raise AnsibleError(
+                    'Failed to set file mode on remote temporary files '
+                    '(rc: {0}, err: {1})'.format(
+                        res['rc'],
+                        to_native(res['stderr'])))
 
-        return remote_paths
+        # Step 3c: File system ACLs failed above; try falling back to chown.
+        res = self._remote_chown(remote_paths, become_user)
+        if res['rc'] == 0:
+            return remote_paths
+
+        # Check if we are an admin/root user. If we are and got here, it means
+        # we failed to chown as root and something weird has happened.
+        if remote_user in self._get_admin_users():
+            raise AnsibleError(
+                'Failed to change ownership of the temporary files Ansible '
+                'needs to create despite connecting as a privileged user. '
+                'Unprivileged become user would be unable to read the '
+                'file.')
+
+        # Step 3d: Try macOS's special chmod + ACL
+        # macOS chmod's +a flag takes its own argument. As a slight hack, we
+        # pass that argument as the first element of remote_paths. So we end
+        # up running `chmod +a [that argument] [file 1] [file 2] ...`
+        try:
+            res = self._remote_chmod([chmod_acl_mode] + remote_paths, '+a')
+        except AnsibleAuthenticationFailure as e:
+            # Solaris-based chmod will return 5 when it sees an invalid mode,
+            # and +a is invalid there. Because it returns 5, which is the same
+            # thing sshpass returns on auth failure, our sshpass code will
+            # assume that auth failed. If we don't handle that case here, none
+            # of the other logic below will get run. This is fairly hacky and a
+            # corner case, but probably one that shows up pretty often in
+            # Solaris-based environments (and possibly others).
+            pass
+        else:
+            if res['rc'] == 0:
+                return remote_paths
+
+        # Step 3e: Try Solaris/OpenSolaris/OpenIndiana-sans-setfacl chmod
+        # Similar to macOS above, Solaris 11.4 drops setfacl and takes file ACLs
+        # via chmod instead. OpenSolaris and illumos-based distros allow for
+        # using either setfacl or chmod, and compatibility depends on filesystem.
+        # It should be possible to debug this branch by installing OpenIndiana
+        # (use ZFS) and going unpriv -> unpriv.
+        res = self._remote_chmod(remote_paths, posix_acl_mode)
+        if res['rc'] == 0:
+            return remote_paths
+
+        # Step 3f: Common group
+        # Otherwise, we're a normal user. We failed to chown the paths to the
+        # unprivileged user, but if we have a common group with them, we should
+        # be able to chown it to that.
+        #
+        # Note that we have no way of knowing if this will actually work... just
+        # because chgrp exits successfully does not mean that Ansible will work.
+        # We could check if the become user is in the group, but this would
+        # create an extra round trip.
+        #
+        # Also note that due to the above, this can prevent the
+        # ALLOW_WORLD_READABLE_TMPFILES logic below from ever getting called. We
+        # leave this up to the user to rectify if they have both of these
+        # features enabled.
+        group = self.get_shell_option('common_remote_group')
+        if group is not None:
+            res = self._remote_chgrp(remote_paths, group)
+            if res['rc'] == 0:
+                # If ALLOW_WORLD_READABLE_TMPFILES is set, we should warn the
+                # user that something might go weirdly here.
+                if C.ALLOW_WORLD_READABLE_TMPFILES:
+                    display.warning(
+                        'Both common_remote_group and '
+                        'allow_world_readable_tmpfiles are set. chgrp was '
+                        'successful, but there is no guarantee that Ansible '
+                        'will be able to read the files after this operation, '
+                        'particularly if common_remote_group was set to a '
+                        'group of which the unprivileged become user is not a '
+                        'member. In this situation, '
+                        'allow_world_readable_tmpfiles is a no-op. See this '
+                        'URL for more details: '
+                        'https://docs.ansible.com/ansible/become.html'
+                        '#becoming-an-unprivileged-user')
+                if execute:
+                    group_mode = 'g+rwx'
+                else:
+                    group_mode = 'g+rw'
+                res = self._remote_chmod(remote_paths, group_mode)
+                if res['rc'] == 0:
+                    return remote_paths
+
+        # Step 4: World-readable temp directory
+        if self.get_shell_option(
+                'world_readable_temp',
+                C.ALLOW_WORLD_READABLE_TMPFILES):
+            # chown and fs acls failed -- do things this insecure way only if
+            # the user opted in in the config file
+            display.warning(
+                'Using world-readable permissions for temporary files Ansible '
+                'needs to create when becoming an unprivileged user. This may '
+                'be insecure. For information on securing this, see '
+                'https://docs.ansible.com/ansible/user_guide/become.html'
+                '#risks-of-becoming-an-unprivileged-user')
+            res = self._remote_chmod(remote_paths, 'a+%s' % chmod_mode)
+            if res['rc'] == 0:
+                return remote_paths
+            raise AnsibleError(
+                'Failed to set file mode on remote files '
+                '(rc: {0}, err: {1})'.format(
+                    res['rc'],
+                    to_native(res['stderr'])))
+
+        raise AnsibleError(
+            'Failed to set permissions on the temporary files Ansible needs '
+            'to create when becoming an unprivileged user '
+            '(rc: %s, err: %s}). For information on working around this, see '
+            'https://docs.ansible.com/ansible/become.html'
+            '#becoming-an-unprivileged-user' % (
+                res['rc'],
+                to_native(res['stderr'])))
 
     def _remote_chmod(self, paths, mode, sudoable=False):
         '''
@@ -678,7 +773,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             get_checksum=checksum,
             checksum_algorithm='sha1',
         )
-        mystat = self._execute_module(module_name='stat', module_args=module_args, task_vars=all_vars,
+        mystat = self._execute_module(module_name='ansible.legacy.stat', module_args=module_args, task_vars=all_vars,
                                       wrap_async=False)
 
         if mystat.get('failed'):
@@ -969,8 +1064,8 @@ class ActionBase(with_metaclass(ABCMeta, object)):
 
         if wrap_async and not self._connection.always_pipeline_modules:
             # configure, upload, and chmod the async_wrapper module
-            (async_module_style, shebang, async_module_data, async_module_path) = self._configure_module(module_name='async_wrapper', module_args=dict(),
-                                                                                                         task_vars=task_vars)
+            (async_module_style, shebang, async_module_data, async_module_path) = self._configure_module(
+                module_name='ansible.legacy.async_wrapper', module_args=dict(), task_vars=task_vars)
             async_module_remote_filename = self._connection._shell.get_remote_filename(async_module_path)
             remote_async_module_path = self._connection._shell.join_path(tmpdir, async_module_remote_filename)
             self._transfer_data(remote_async_module_path, async_module_data)
@@ -1080,7 +1175,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
 
     def _parse_returned_data(self, res):
         try:
-            filtered_output, warnings = _filter_non_json_lines(res.get('stdout', u''))
+            filtered_output, warnings = _filter_non_json_lines(res.get('stdout', u''), objects_only=True)
             for w in warnings:
                 display.warning(w)
 
@@ -1104,7 +1199,8 @@ class ActionBase(with_metaclass(ABCMeta, object)):
 
             # try to figure out if we are missing interpreter
             if self._used_interpreter is not None:
-                match = re.compile('%s: (?:No such file or directory|not found)' % self._used_interpreter.lstrip('!#'))
+                interpreter = re.escape(self._used_interpreter.lstrip('!#'))
+                match = re.compile('%s: (?:No such file or directory|not found)' % interpreter)
                 if match.search(data['module_stderr']) or match.search(data['module_stdout']):
                     data['msg'] = "The module failed to execute correctly, you probably need to set the interpreter."
 
@@ -1209,7 +1305,9 @@ class ActionBase(with_metaclass(ABCMeta, object)):
 
         diff = {}
         display.debug("Going to peek to see if file has changed permissions")
-        peek_result = self._execute_module(module_name='file', module_args=dict(path=destination, _diff_peek=True), task_vars=task_vars, persist_files=True)
+        peek_result = self._execute_module(
+            module_name='ansible.legacy.file', module_args=dict(path=destination, _diff_peek=True),
+            task_vars=task_vars, persist_files=True)
 
         if peek_result.get('failed', False):
             display.warning(u"Failed to get diff between '%s' and '%s': %s" % (os.path.basename(source), destination, to_text(peek_result.get(u'msg', u''))))
@@ -1225,7 +1323,9 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 diff['dst_larger'] = C.MAX_FILE_SIZE_FOR_DIFF
             else:
                 display.debug(u"Slurping the file %s" % source)
-                dest_result = self._execute_module(module_name='slurp', module_args=dict(path=destination), task_vars=task_vars, persist_files=True)
+                dest_result = self._execute_module(
+                    module_name='ansible.legacy.slurp', module_args=dict(path=destination),
+                    task_vars=task_vars, persist_files=True)
                 if 'content' in dest_result:
                     dest_contents = dest_result['content']
                     if dest_result['encoding'] == u'base64':

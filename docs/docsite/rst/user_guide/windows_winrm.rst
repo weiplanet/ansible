@@ -281,6 +281,7 @@ The following example shows host vars configured for Kerberos authentication:
     ansible_user: username@MY.DOMAIN.COM
     ansible_password: Password
     ansible_connection: winrm
+    ansible_port: 5985
     ansible_winrm_transport: kerberos
 
 As of Ansible version 2.3, the Kerberos ticket will be created based on
@@ -303,7 +304,7 @@ Some system dependencies that must be installed prior to using Kerberos. The scr
 .. code-block:: shell
 
     # Via Yum (RHEL/Centos/Fedora)
-    yum -y install python-devel krb5-devel krb5-libs krb5-workstation
+    yum -y install gcc python-devel krb5-devel krb5-libs krb5-workstation
 
     # Via Apt (Ubuntu)
     sudo apt-get install python-dev libkrb5-dev krb5-user
@@ -904,7 +905,7 @@ Some of these limitations can be mitigated by doing one of the following:
    :ref:`playbooks_intro`
        An introduction to playbooks
    :ref:`playbooks_best_practices`
-       Best practices advice
+       Tips and tricks for playbooks
    :ref:`List of Windows Modules <windows_modules>`
        Windows specific module list, all implemented in PowerShell
    `User Mailing List <https://groups.google.com/group/ansible-project>`_

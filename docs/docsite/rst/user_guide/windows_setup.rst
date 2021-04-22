@@ -37,6 +37,7 @@ This is an example of how to run this script from PowerShell:
 
 .. code-block:: powershell
 
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $url = "https://raw.githubusercontent.com/jborean93/ansible-windows/master/scripts/Upgrade-PowerShell.ps1"
     $file = "$env:temp\Upgrade-PowerShell.ps1"
     $username = "Administrator"
@@ -49,13 +50,13 @@ This is an example of how to run this script from PowerShell:
     &$file -Version 5.1 -Username $username -Password $password -Verbose
 
 Once completed, you will need to remove auto logon
-and set the execution policy back to the default of ``Restricted``. You can
+and set the execution policy back to the default (``Restricted `` for Windows clients, or ``RemoteSigned`` for Windows servers). You can
 do this with the following PowerShell commands:
 
 .. code-block:: powershell
 
     # This isn't needed but is a good security practice to complete
-    Set-ExecutionPolicy -ExecutionPolicy Restricted -Force
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force
 
     $reg_winlogon_path = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
     Set-ItemProperty -Path $reg_winlogon_path -Name AutoAdminLogon -Value 0
@@ -95,6 +96,7 @@ The following PowerShell command will install the hotfix:
 
 .. code-block:: powershell
 
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $url = "https://raw.githubusercontent.com/jborean93/ansible-windows/master/scripts/Install-WMF3Hotfix.ps1"
     $file = "$env:temp\Install-WMF3Hotfix.ps1"
 
@@ -120,6 +122,7 @@ To use this script, run the following in PowerShell:
 
 .. code-block:: powershell
 
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $url = "https://raw.githubusercontent.com/ansible/ansible/devel/examples/scripts/ConfigureRemotingForAnsible.ps1"
     $file = "$env:temp\ConfigureRemotingForAnsible.ps1"
 
@@ -564,7 +567,7 @@ Here are the known ones:
    :ref:`about_playbooks`
        An introduction to playbooks
    :ref:`playbooks_best_practices`
-       Best practices advice
+       Tips and tricks for playbooks
    :ref:`List of Windows Modules <windows_modules>`
        Windows specific module list, all implemented in PowerShell
    `User Mailing List <https://groups.google.com/group/ansible-project>`_

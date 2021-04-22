@@ -13,6 +13,7 @@ LOGGING_MESSAGE_FILTER = re.compile("^("
                                     ".*Running pip install with root privileges is generally not a good idea.*|"  # custom Fedora patch [1]
                                     "DEPRECATION: Python 2.7 will reach the end of its life .*|"  # pip 19.2.3
                                     "Ignoring .*: markers .* don't match your environment|"
+                                    "Looking in indexes: .*|"  # pypi-test-container
                                     "Requirement already satisfied.*"
                                     ")$")
 
@@ -40,6 +41,10 @@ WARNING_MESSAGE_FILTERS = (
     # pip 21.0 will drop support for Python 2.7 in January 2021.
     # More details about Python 2 support in pip, can be found at https://pip.pypa.io/en/latest/development/release-process/#python-2-support
     'DEPRECATION: Python 2.7 reached the end of its life ',
+
+    # DEPRECATION: Python 3.5 reached the end of its life on September 13th, 2020. Please upgrade your Python as Python 3.5 is no longer maintained.
+    # pip 21.0 will drop support for Python 3.5 in January 2021. pip 21.0 will remove support for this functionality.
+    'DEPRECATION: Python 3.5 reached the end of its life ',
 )
 
 

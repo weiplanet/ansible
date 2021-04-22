@@ -19,6 +19,7 @@ from ..util import (
 
 from ..util_common import (
     ResultType,
+    write_json_file,
     write_json_test_results,
 )
 
@@ -78,6 +79,9 @@ def _command_coverage_combine_python(args):
             continue
 
         for filename, arcs in enumerate_python_arcs(coverage_file, coverage, modules, collection_search_re, collection_sub_re):
+            if args.export:
+                filename = os.path.relpath(filename)  # exported paths must be relative since absolute paths may differ between systems
+
             if group not in groups:
                 groups[group] = {}
 
@@ -90,7 +94,12 @@ def _command_coverage_combine_python(args):
 
     output_files = []
 
-    coverage_file = os.path.join(ResultType.COVERAGE.path, COVERAGE_OUTPUT_FILE_NAME)
+    if args.export:
+        coverage_file = os.path.join(args.export, '')
+        suffix = '=coverage.combined'
+    else:
+        coverage_file = os.path.join(ResultType.COVERAGE.path, COVERAGE_OUTPUT_FILE_NAME)
+        suffix = ''
 
     path_checker = PathChecker(args, collection_search_re)
 
@@ -109,7 +118,7 @@ def _command_coverage_combine_python(args):
             updated.add_arcs(dict((source[0], []) for source in sources))
 
         if not args.explain:
-            output_file = coverage_file + group
+            output_file = coverage_file + group + suffix
             updated.write_file(output_file)  # always write files to make sure stale files do not exist
 
             if updated:
@@ -151,6 +160,9 @@ def _command_coverage_combine_powershell(args):
             continue
 
         for filename, hits in enumerate_powershell_lines(coverage_file, collection_search_re, collection_sub_re):
+            if args.export:
+                filename = os.path.relpath(filename)  # exported paths must be relative since absolute paths may differ between systems
+
             if group not in groups:
                 groups[group] = {}
 
@@ -180,9 +192,15 @@ def _command_coverage_combine_powershell(args):
                 coverage_data[source] = _default_stub_value(source_line_count)
 
         if not args.explain:
+            if args.export:
+                output_file = os.path.join(args.export, group + '=coverage.combined')
+                write_json_file(output_file, coverage_data, formatted=False)
+                output_files.append(output_file)
+                continue
+
             output_file = COVERAGE_OUTPUT_FILE_NAME + group + '-powershell'
 
-            write_json_test_results(ResultType.COVERAGE, output_file, coverage_data)
+            write_json_test_results(ResultType.COVERAGE, output_file, coverage_data, formatted=False)
 
             output_files.append(os.path.join(ResultType.COVERAGE.path, output_file))
 
@@ -267,10 +285,19 @@ def get_coverage_group(args, coverage_file):
         version=parts[3],
     )
 
+    export_names = dict(
+        version=parts[3],
+    )
+
     group = ''
 
     for part in COVERAGE_GROUPS:
         if part in args.group_by:
             group += '=%s' % names[part]
+        elif args.export:
+            group += '=%s' % export_names.get(part, 'various')
+
+    if args.export:
+        group = group.lstrip('=')
 
     return group

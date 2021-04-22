@@ -4,25 +4,24 @@ __metaclass__ = type
 
 import os
 
+from ..util import (
+    ApplicationError,
+    ConfigParser,
+    display,
+)
+
+from ..config import (
+    IntegrationConfig,
+)
+
+from ..containers import (
+    run_support_container,
+)
+
 from . import (
-    CloudProvider,
     CloudEnvironment,
     CloudEnvironmentConfig,
-)
-
-from ..util import (
-    find_executable,
-    display,
-    ConfigParser,
-    ApplicationError,
-)
-
-from ..docker_util import (
-    docker_run,
-    docker_rm,
-    docker_inspect,
-    docker_pull,
-    get_docker_container_id,
+    CloudProvider,
 )
 
 
@@ -30,10 +29,7 @@ class VcenterProvider(CloudProvider):
     """VMware vcenter/esx plugin. Sets up cloud resources for tests."""
     DOCKER_SIMULATOR_NAME = 'vcenter-simulator'
 
-    def __init__(self, args):
-        """
-        :type args: TestConfig
-        """
+    def __init__(self, args):  # type: (IntegrationConfig) -> None
         super(VcenterProvider, self).__init__(args)
 
         # The simulator must be pinned to a specific version to guarantee CI passes with the version used.
@@ -41,44 +37,24 @@ class VcenterProvider(CloudProvider):
             self.image = os.environ.get('ANSIBLE_VCSIM_CONTAINER')
         else:
             self.image = 'quay.io/ansible/vcenter-test-container:1.7.0'
-        self.container_name = ''
 
         # VMware tests can be run on govcsim or BYO with a static config file.
         # The simulator is the default if no config is provided.
         self.vmware_test_platform = os.environ.get('VMWARE_TEST_PLATFORM', 'govcsim')
-        self.insecure = False
-        self.proxy = None
-        self.platform = 'vcenter'
 
-    def filter(self, targets, exclude):
-        """Filter out the cloud tests when the necessary config and resources are not available.
-        :type targets: tuple[TestTarget]
-        :type exclude: list[str]
-        """
-        if self.vmware_test_platform == 'govcsim' or (self.vmware_test_platform == '' and not os.path.isfile(self.config_static_path)):
-            docker = find_executable('docker', required=False)
-
-            if docker:
-                return
-
-            skip = 'cloud/%s/' % self.platform
-            skipped = [target.name for target in targets if skip in target.aliases]
-
-            if skipped:
-                exclude.append(skip)
-                display.warning('Excluding tests marked "%s" which require the "docker" command or config (see "%s"): %s'
-                                % (skip.rstrip('/'), self.config_template_path, ', '.join(skipped)))
+        if self.vmware_test_platform == 'govcsim':
+            self.uses_docker = True
+            self.uses_config = False
         elif self.vmware_test_platform == 'static':
-            if os.path.isfile(self.config_static_path):
-                return
+            self.uses_docker = False
+            self.uses_config = True
 
-            super(VcenterProvider, self).filter(targets, exclude)
-
-    def setup(self):
+    def setup(self):  # type: () -> None
         """Setup the cloud resource before delegation and register a cleanup callback."""
         super(VcenterProvider, self).setup()
 
         self._set_cloud_config('vmware_test_platform', self.vmware_test_platform)
+
         if self.vmware_test_platform == 'govcsim':
             self._setup_dynamic_simulator()
             self.managed = True
@@ -88,101 +64,38 @@ class VcenterProvider(CloudProvider):
         else:
             raise ApplicationError('Unknown vmware_test_platform: %s' % self.vmware_test_platform)
 
-    def get_docker_run_options(self):
-        """Get any additional options needed when delegating tests to a docker container.
-        :rtype: list[str]
-        """
-        if self.managed:
-            return ['--link', self.DOCKER_SIMULATOR_NAME]
-
-        return []
-
-    def cleanup(self):
-        """Clean up the cloud resource and any temporary configuration files after tests complete."""
-        if self.container_name:
-            docker_rm(self.args, self.container_name)
-
-        super(VcenterProvider, self).cleanup()
-
-    def _setup_dynamic_simulator(self):
+    def _setup_dynamic_simulator(self):  # type: () -> None
         """Create a vcenter simulator using docker."""
-        container_id = get_docker_container_id()
+        ports = [
+            443,
+            8080,
+            8989,
+            5000,  # control port for flask app in simulator
+        ]
 
-        if container_id:
-            display.info('Running in docker container: %s' % container_id, verbosity=1)
+        descriptor = run_support_container(
+            self.args,
+            self.platform,
+            self.image,
+            self.DOCKER_SIMULATOR_NAME,
+            ports,
+            allow_existing=True,
+            cleanup=True,
+        )
 
-        self.container_name = self.DOCKER_SIMULATOR_NAME
+        descriptor.register(self.args)
 
-        results = docker_inspect(self.args, self.container_name)
+        self._set_cloud_config('vcenter_hostname', self.DOCKER_SIMULATOR_NAME)
 
-        if results and not results[0].get('State', {}).get('Running'):
-            docker_rm(self.args, self.container_name)
-            results = []
-
-        if results:
-            display.info('Using the existing vCenter simulator docker container.', verbosity=1)
-        else:
-            display.info('Starting a new vCenter simulator docker container.', verbosity=1)
-
-            if not self.args.docker and not container_id:
-                # publish the simulator ports when not running inside docker
-                publish_ports = [
-                    '-p', '1443:443',
-                    '-p', '8080:8080',
-                    '-p', '8989:8989',
-                    '-p', '5000:5000',  # control port for flask app in simulator
-                ]
-            else:
-                publish_ports = []
-
-            if not os.environ.get('ANSIBLE_VCSIM_CONTAINER'):
-                docker_pull(self.args, self.image)
-
-            docker_run(
-                self.args,
-                self.image,
-                ['-d', '--name', self.container_name] + publish_ports,
-            )
-
-        if self.args.docker:
-            vcenter_hostname = self.DOCKER_SIMULATOR_NAME
-        elif container_id:
-            vcenter_hostname = self._get_simulator_address()
-            display.info('Found vCenter simulator container address: %s' % vcenter_hostname, verbosity=1)
-        else:
-            vcenter_hostname = 'localhost'
-
-        self._set_cloud_config('vcenter_hostname', vcenter_hostname)
-
-    def _get_simulator_address(self):
-        results = docker_inspect(self.args, self.container_name)
-        ipaddress = results[0]['NetworkSettings']['IPAddress']
-        return ipaddress
-
-    def _setup_static(self):
+    def _setup_static(self):  # type: () -> None
         if not os.path.exists(self.config_static_path):
             raise ApplicationError('Configuration file does not exist: %s' % self.config_static_path)
-
-        parser = ConfigParser({
-            'vcenter_port': '443',
-            'vmware_proxy_host': '',
-            'vmware_proxy_port': '8080'})
-        parser.read(self.config_static_path)
-
-        if parser.get('DEFAULT', 'vmware_validate_certs').lower() in ('no', 'false'):
-            self.insecure = True
-        proxy_host = parser.get('DEFAULT', 'vmware_proxy_host')
-        proxy_port = int(parser.get('DEFAULT', 'vmware_proxy_port'))
-        if proxy_host and proxy_port:
-            self.proxy = 'http://%s:%d' % (proxy_host, proxy_port)
 
 
 class VcenterEnvironment(CloudEnvironment):
     """VMware vcenter/esx environment plugin. Updates integration test environment after delegation."""
-    def get_environment_config(self):
-        """
-        :rtype: CloudEnvironmentConfig
-        """
+    def get_environment_config(self):  # type: () -> CloudEnvironmentConfig
+        """Return environment configuration for use in the test environment after delegation."""
         try:
             # We may be in a container, so we cannot just reach VMWARE_TEST_PLATFORM,
             # We do a try/except instead
@@ -207,10 +120,6 @@ class VcenterEnvironment(CloudEnvironment):
                 vcenter_username='user',
                 vcenter_password='pass',
             )
-            # Shippable starts ansible-test from withing an existing container,
-            # and in this case, we don't have to change the vcenter port.
-            if not self.args.docker and not get_docker_container_id():
-                ansible_vars['vcenter_port'] = '1443'
 
         for key, value in ansible_vars.items():
             if key.endswith('_password'):

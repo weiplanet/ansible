@@ -3,7 +3,7 @@
 Patterns: targeting hosts and groups
 ====================================
 
-When you execute Ansible through an ad-hoc command or by running a playbook, you must choose which managed nodes or groups you want to execute against. Patterns let you run commands and playbooks against specific hosts and/or groups in your inventory. An Ansible pattern can refer to a single host, an IP address, an inventory group, a set of groups, or all hosts in your inventory. Patterns are highly flexible - you can exclude or require subsets of hosts, use wildcards or regular expressions, and more. Ansible executes on all inventory hosts included in the pattern.
+When you execute Ansible through an ad hoc command or by running a playbook, you must choose which managed nodes or groups you want to execute against. Patterns let you run commands and playbooks against specific hosts and/or groups in your inventory. An Ansible pattern can refer to a single host, an IP address, an inventory group, a set of groups, or all hosts in your inventory. Patterns are highly flexible - you can exclude or require subsets of hosts, use wildcards or regular expressions, and more. Ansible executes on all inventory hosts included in the pattern.
 
 .. contents::
    :local:
@@ -11,7 +11,7 @@ When you execute Ansible through an ad-hoc command or by running a playbook, you
 Using patterns
 --------------
 
-You use a pattern almost any time you execute an ad-hoc command or a playbook. The pattern is the only element of an :ref:`ad-hoc command<intro_adhoc>` that has no flag. It is usually the second element::
+You use a pattern almost any time you execute an ad hoc command or a playbook. The pattern is the only element of an :ref:`ad hoc command<intro_adhoc>` that has no flag. It is usually the second element::
 
     ansible <pattern> -m <module_name> -a "<module options>"
 
@@ -31,7 +31,7 @@ For example::
     - name: restart webservers
       hosts: webservers
 
-Since you often want to run a command or playbook against multiple hosts at once, patterns often refer to inventory groups. Both the ad-hoc command and the playbook above will execute against all machines in the ``webservers`` group.
+Since you often want to run a command or playbook against multiple hosts at once, patterns often refer to inventory groups. Both the ad hoc command and the playbook above will execute against all machines in the ``webservers`` group.
 
 .. _common_patterns:
 
@@ -145,7 +145,7 @@ You can specify a pattern as a regular expression by starting the pattern with `
 Patterns and ansible-playbook flags
 -----------------------------------
 
-You can change the behavior of the patterns defined in playbooks using command-line options. For example, you can run a playbook that defines ``hosts: all`` on a single host by specifying ``-i 127.0.0.2,``. This works even if the host you target is not defined in your inventory. You can also limit the hosts you target on a particular run with the ``--limit`` flag::
+You can change the behavior of the patterns defined in playbooks using command-line options. For example, you can run a playbook that defines ``hosts: all`` on a single host by specifying ``-i 127.0.0.2,`` (note the trailing comma). This works even if the host you target is not defined in your inventory. You can also limit the hosts you target on a particular run with the ``--limit`` flag::
 
     ansible-playbook site.yml --limit datacenter2
 
@@ -153,7 +153,7 @@ Finally, you can use ``--limit`` to read the list of hosts from a file by prefix
 
     ansible-playbook site.yml --limit @retry_hosts.txt
 
-If :ref:`RETRY_FILES_ENABLED` is set to ``True``, a ``.retry`` file will be created after the ``ansible-playbook`` run containing a list of failed hosts from all plays. This file is overwritten each time ``ansible-playook`` finishes running.
+If :ref:`RETRY_FILES_ENABLED` is set to ``True``, a ``.retry`` file will be created after the ``ansible-playbook`` run containing a list of failed hosts from all plays. This file is overwritten each time ``ansible-playbook`` finishes running.
 
     ansible-playbook site.yml --limit @site.retry
 

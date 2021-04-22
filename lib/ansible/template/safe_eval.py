@@ -106,13 +106,21 @@ def safe_eval(expr, locals=None, include_exceptions=False):
 
     filter_list = []
     for filter_ in filter_loader.all():
-        filter_list.extend(filter_.filters().keys())
+        try:
+            filter_list.extend(filter_.filters().keys())
+        except Exception:
+            # This is handled and displayed in JinjaPluginIntercept._load_ansible_plugins
+            continue
 
     test_list = []
     for test in test_loader.all():
-        test_list.extend(test.tests().keys())
+        try:
+            test_list.extend(test.tests().keys())
+        except Exception:
+            # This is handled and displayed in JinjaPluginIntercept._load_ansible_plugins
+            continue
 
-    CALL_WHITELIST = C.DEFAULT_CALLABLE_WHITELIST + filter_list + test_list
+    CALL_ENABLED = C.CALLABLE_ACCEPT_LIST + filter_list + test_list
 
     class CleansingNodeVisitor(ast.NodeVisitor):
         def generic_visit(self, node, inside_call=False):
@@ -124,7 +132,7 @@ def safe_eval(expr, locals=None, include_exceptions=False):
                 # Disallow calls to builtin functions that we have not vetted
                 # as safe.  Other functions are excluded by setting locals in
                 # the call to eval() later on
-                if hasattr(builtins, node.id) and node.id not in CALL_WHITELIST:
+                if hasattr(builtins, node.id) and node.id not in CALL_ENABLED:
                     raise Exception("invalid function: %s" % node.id)
             # iterate over all child nodes
             for child_node in ast.iter_child_nodes(node):
@@ -140,7 +148,7 @@ def safe_eval(expr, locals=None, include_exceptions=False):
     try:
         parsed_tree = ast.parse(expr, mode='eval')
         cnv.visit(parsed_tree)
-        compiled = compile(parsed_tree, to_native(expr), 'eval')
+        compiled = compile(parsed_tree, '<expr %s>' % to_native(expr), 'eval')
         # Note: passing our own globals and locals here constrains what
         # callables (and other identifiers) are recognized.  this is in
         # addition to the filtering of builtins done in CleansingNodeVisitor

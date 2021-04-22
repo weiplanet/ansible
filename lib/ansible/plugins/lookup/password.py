@@ -7,12 +7,12 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 DOCUMENTATION = """
-    lookup: password
+    name: password
     version_added: "1.1"
     author:
-      - Daniel Hokka Zakrisson <daniel@hozac.com>
-      - Javier Candeira <javier@candeira.com>
-      - Maykel Moya <mmoya@speedyrails.com>
+      - Daniel Hokka Zakrisson (!UNKNOWN) <daniel@hozac.com>
+      - Javier Candeira (!UNKNOWN) <javier@candeira.com>
+      - Maykel Moya (!UNKNOWN) <mmoya@speedyrails.com>
     short_description: retrieve or generate a random password, stored in a file
     description:
       - Generates a random plaintext password and stores it in a file at a given filepath.
@@ -28,7 +28,7 @@ DOCUMENTATION = """
          required: True
       encrypt:
         description:
-           - Which hash scheme to encrypt the returning password, should be one hash scheme from C(passlib.hash).
+           - Which hash scheme to encrypt the returning password, should be one hash scheme from C(passlib.hash; md5_crypt, bcrypt, sha256_crypt, sha512_crypt).
            - If not provided, the password will be returned in plain text.
            - Note that the password is always stored as plain text, only the returning password is encrypted.
            - Encrypt also forces saving the salt value for idempotence.
@@ -37,8 +37,12 @@ DOCUMENTATION = """
         version_added: "1.4"
         description:
           - Define comma separated list of names that compose a custom character set in the generated passwords.
-          - 'By default generated passwords contain a random mix of upper and lowercase ASCII letters, the numbers 0-9 and punctuation (". , : - _").'
-          - "They can be either parts of Python's string module attributes (ascii_letters,digits, etc) or are used literally ( :, -)."
+          - 'By default generated passwords contain a random mix of upper and lowercase ASCII letters, the numbers 0-9, and punctuation (". , : - _").'
+          - "They can be either parts of Python's string module attributes or represented literally ( :, -)."
+          - "Though string modules can vary by Python version, valid values for both major releases include:
+            'ascii_lowercase', 'ascii_uppercase', 'digits', 'hexdigits', 'octdigits', 'printable', 'punctuation' and 'whitespace'."
+          - Be aware that Python's 'hexdigits' includes lower and upper case versions of a-f, so it is not a good choice as it doubles
+            the chances of those values for systems that won't distinguish case, distorting the expected entropy.
           - "To enter comma use two commas ',,' somewhere - preferably at the end. Quotes and double quotes are not supported."
         type: string
       length:
@@ -82,14 +86,20 @@ EXAMPLES = """
 - name: create a mysql user with a random password using many different char sets
   mysql_user:
     name: "{{ client }}"
-    password: "{{ lookup('password', '/tmp/passwordfile chars=ascii_letters,digits,hexdigits,punctuation') }}"
+    password: "{{ lookup('password', '/tmp/passwordfile chars=ascii_letters,digits,punctuation') }}"
     priv: "{{ client }}_{{ tier }}_{{ role }}.*:ALL"
+
+- name: create lowercase 8 character name for Kubernetes pod name
+  set_fact:
+    random_pod_name: "web-{{ lookup('password', '/dev/null chars=ascii_lowercase,digits length=8') }}"
 """
 
 RETURN = """
 _raw:
   description:
     - a password
+  type: list
+  elements: str
 """
 
 import os
@@ -102,7 +112,7 @@ from ansible.errors import AnsibleError, AnsibleAssertionError
 from ansible.module_utils._text import to_bytes, to_native, to_text
 from ansible.parsing.splitter import parse_kv
 from ansible.plugins.lookup import LookupBase
-from ansible.utils.encrypt import do_encrypt, random_password, random_salt
+from ansible.utils.encrypt import BaseHash, do_encrypt, random_password, random_salt
 from ansible.utils.path import makedirs_safe
 
 
@@ -320,20 +330,24 @@ class LookupModule(LookupBase):
             else:
                 plaintext_password, salt = _parse_content(content)
 
-            if params['encrypt'] and not salt:
+            encrypt = params['encrypt']
+            if encrypt and not salt:
                 changed = True
-                salt = random_salt()
+                try:
+                    salt = random_salt(BaseHash.algorithms[encrypt].salt_size)
+                except KeyError:
+                    salt = random_salt()
 
             if changed and b_path != to_bytes('/dev/null'):
-                content = _format_content(plaintext_password, salt, encrypt=params['encrypt'])
+                content = _format_content(plaintext_password, salt, encrypt=encrypt)
                 _write_password_file(b_path, content)
 
             if first_process:
                 # let other processes continue
                 _release_lock(lockfile)
 
-            if params['encrypt']:
-                password = do_encrypt(plaintext_password, params['encrypt'], salt=salt)
+            if encrypt:
+                password = do_encrypt(plaintext_password, encrypt, salt=salt)
                 ret.append(password)
             else:
                 ret.append(plaintext_password)
